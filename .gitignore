@@ -62,3 +62,12 @@ git_token.MD
 pyspy_*/
 .coverage
 htmlcov/
+
+# Agent 协作私有约定（不公开）
+CLAUDE.md
+
+# 文档归档：内部 review、环境快照（不公开）
+docs/archive/
+
+# 配图：实验未跑完前不挂占位图
+docs/figures/

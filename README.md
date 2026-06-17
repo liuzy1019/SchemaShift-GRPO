@@ -7,34 +7,19 @@
 [![Tests 105 passed](https://img.shields.io/badge/tests-105%20passed-brightgreen.svg)](./tests)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#-许可)
 
-> **面向 MCP Tool Schema 鲁棒性的 GRPO 训练优化**
-> 标准 GRPO 在多轮 function calling 任务上会放大模型对训练 schema 表面形式的过拟合 —— 工具名、描述措辞、枚举值变了就答不对。**SchemaShift-GRPO** 通过 *Schema Augmentation*（信号源）+ *Stratified Advantage*（信号通路）的联合设计，专门针对 schema 鲁棒性场景构建抗过拟合训练通路。
+> **面向 MCP / function calling Schema 鲁棒性的 GRPO 训练**
+> 训练时对 BFCL V3 multi-turn 的 schema 做同义扰动（none/mild/strong），并在 verl 里换掉默认 GRPO advantage 为**按扰动强度分层的 z-score**。目标是让策略在换了工具名 / 描述措辞 / 枚举值的 schema 上仍能答对。
 
-> **🛠️ 工程进度（2026-06-16 收尾）**：`arl` 环境已降到 verl 0.6.1 兼容窗口（4×A10 / torch 2.8 / vllm 0.11 / flash_attn 2.7.3）。**E3 / E4 / E5 三个 smoke 全部跑通到 step 1**：loss 有限、grad_norm finite、ckpt 落盘。正式训练（>1 step）尚未开始。本阶段修复链：BFCL `test_entry_id` 透传 → `max_prompt_length` 2048→10240 → vLLM/flashinfer JIT 绕路 → AgentLoopWorker 卡死根因（`_parse_bfcl_native_args` O(N²) → bounded linear parser）→ E4 ray actor 跨进程 estimator 注册 → 数据长度预检自动化。**105/105 tests pass**。详见 [`docs/project_status.md`](./docs/project_status.md) 与 [`docs/archive/review.md`](./docs/archive/review.md)。
-
----
-
-## 🔥 核心结果
-
-> 实验尚未运行。GPU 集成完成后回填本节。
-
-| 指标 | Vanilla GRPO | +Aug | +StratAdv (Ours) | 相较 Vanilla |
-|------|-------------|------|-----------------|-------------|
-| **整体 pass@1** | — | — | — | — |
-| **原版 pass@1** | — | — | — | — |
-| **mild pass@1** | — | — | — | — |
-| **strong pass@1** | — | — | — | — |
-| **Robustness Gap** | — | — | — | — |
+> **📦 状态**：代码与脚本就绪，单元 / 集成测试 105/105 通过。**正式训练与评测尚未开始，结果待跑出后回填**。工程过程细节见 [`docs/project_status.md`](./docs/project_status.md)。
 
 ---
 
-## 🎯 问题：GRPO 放大 Schema 过拟合
+## 🎯 问题
 
-标准 GRPO 在 function calling 任务上有三个致命问题：
+标准 GRPO 在 BFCL multi-turn 这类 function calling 任务上有两个已知问题：
 
-1. **Schema 表面形式过拟合**：GRPO 会放大模型对训练 schema 具体工具名 / 描述措辞 / 枚举值的依赖，换个同义写法就脚
-2. **群组奖励饱和**：二元 reward（0/1），group_size 较大时容易全 0 或全 1 → advantage 方差→0 → 梯度消失
-3. **扰动信号淹没**：强扰动下模型更难答对，reward 偏低。标准 GRPO 的 prompt 内 z-score 会惩罚所有低分 rollout，包括"困难条件下表现合理"的
+1. **Schema 表面形式过拟合**：训练集里是 `search_flights(origin, destination)`，换成 `find_flights(departure_location, to)` 就答不对。
+2. **群组奖励饱和**：二元 reward（0/1），group 内容易全 0 或全 1 → advantage 方差→ 0 → 梯度消失。
 
 ```
 训练：search_flights(origin="JFK", destination="LHR")  → 正确
@@ -45,76 +30,51 @@
 
 ## 💡 方法
 
-### Schema Augmentation（信号源）
+### Schema Augmentation
 
-训练时混合 3 种扰动强度的 schema 变体（none/mild/strong），让模型见过不同的表面形式。扰动是确定性的（给定 seed），基于内置同义词映射表（~100 条规则）。
+训练时按任务、按 seed 生成 3 个扰动强度的变体：
 
 ```
-mild:  tool_name 同义替换
-      search_flights → find_flights
-
+none:   原始 schema
+mild:   tool_name 同义替换
+        search_flights → find_flights
 strong: tool_name + description + enum 全部替换
-      search_flights → find_flights
-      "Search for available flights" → "Lookup for accessible flights"
-      "economy" → "standard"
+        search_flights → find_flights
+        "Search for available flights" → "Lookup for accessible flights"
+        "economy" → "standard"
 ```
 
-扰动器同时维护 `name_map` 和 `enum_map`，用于训练时 API dispatch 反向映射和评估时 ground truth 同步。
+扰动器是纯规则的（`schema_perturber.py`），`api_mapper.py` 同时维护 `name_map` / `enum_map`，用于训练时 API dispatch 反向映射和评测时 ground truth 同步。同一 `(task_id, level, seed)` 给定后完全可复现。
 
-### Stratified Advantage（信号通路）
+### Stratified Advantage
 
-按扰动强度分层归一化 + 全局残差，防止强扰动 rollout 被弱扰动 rollout 的 reward 碾压。
+把 verl 默认的 GRPO advantage 换为按扰动强度分层的 z-score 加上跨层残差：
 
-**公式**：
 ```
 A = strat_z + beta × global_z
 
-strat_z:  每层（level）内独立 z-score，同一 task 跨 none/mild/strong 分层归一化
-global_z: 同一 task 内跨层全局 z-score（作为跨层比较信号的残差）
-beta:     跨层跨信号强度，默认 0.25
+strat_z:  同一 task 在同扰动层（none/mild/strong）内 z-score
+global_z: 同一 task 跨层 z-score
+beta:     默认 0.25
 ```
 
 - beta=0 → 纯分层归一化
-- beta 很大 → 趋近标准 GRPO
-- 单样本层/组：std=1.0，不产生 NaN
+- beta 趋于 ∞ → 趋近标准 GRPO
+- 单样本层 / 组：std 回退 1.0，不产生 NaN
+
+公式与边界在 [`tests/test_advantage.py`](./tests/test_advantage.py) 中有 10 个 case 覆盖。
 
 ### 与 verl 集成
 
-注册为 verl 的自定义 estimator（`@register_adv_est("schemashift_grpo")`），从 uid 解析分组信息：
+注册为 verl 的自定义 estimator：
 
+```python
+@register_adv_est("schemashift_grpo")
 ```
-uid = "{task_id}___{level}"  →  estimator 解析 task_id 分组、level 分层
-```
 
-verl 的非 GRPO 路径通过 `adv_kwargs` 传入 `index(uid)`。SchemaShift estimator 通过 `register_estimator.py` monkey-patch `verl.compute_advantage` 以注入 `non_tensor_batch`（含 perturbation_level、group_id）。
-
----
-
-## 🌟 技术亮点
-
-### 1. 信号传输理论（算法贡献）
-将 schema 鲁棒性 RL 的失效模式分解为**信号源**与**信号通路**：
-- **信号源**（Schema Aug）：~100 条规则的纯函数扰动器，在 prompt 层制造 none/mild/strong 三档表面形式变体。
-- **信号通路**（Stratified Advantage）：`strat_z + 0.25 × global_z`，按扰动强度分层归一化，防止强扰动 rollout 被弱扰动 rollout 的 reward 碾压。
-- **单独失效**：仅 Aug 而无分层归一化时，强扰动样本被淹没；仅分层而无 Aug 时无表面形式多样性。**联合方案才能解锁鲁棒性提升**（待实验验证）。
-
-> 该分解是**模型无关的**，可推广至任何 schema-perturbation-driven 的 RL 任务（MCP / OpenAPI / 工具调用）。
-
-### 2. 零参数 Process Reward
-`SchemaPerturber` 纯规则式扰动器：
-- **可解释**：每条扰动来自显式的同义词词典（`api_mapper.py` 维护 `name_map` / `enum_map`）。
-- **零可训练参数**：不需要额外的 reward model 训练，不引入 reward hacking 风险。
-- **确定性**：给定 `(task_id, level, seed)` 完全可复现。
-
-### 3. 自定义 verl Estimator
-- 通过 verl `@register_adv_est("schemashift_grpo")` 注册，从 uid (`task_id___level`) 解析分组与分层。
-- `register_estimator.py` monkey-patch `verl.compute_advantage` 注入 `non_tensor_batch`（含 perturbation_level、group_id），打通 verl 主路径。
-- Ray actor 跨进程注册：`run_exp4.py` 在 actor `__init__` 中重新注册 estimator，避免 `Trainer.fit` 之后的 estimator 丢失。
-
-### 4. 工程纪律
-- **数据长度预检**（`length_check.py`）：训练前扫描 parquet，超过 `max_prompt_length` 的样本 fail-fast，避免 verl 内部静默截断。
-- **Bounded linear BFCL parser**：把 `_parse_bfcl_native_args` 从 O(N²) 降到 O(N)，解决 AgentLoopWorker 在长函数列表上卡死的根因。
-- **Smoke 全链路验证**：E3 / E4 / E5 三入口跑到 step 1，loss / grad_norm / ckpt 落盘均经过断言。
+- uid 编码为 `"{task_id}___{level}"`，estimator 从 uid 解析出 task 分组与 level 分层。
+- `register_estimator.py` monkey-patch `verl.compute_advantage` ，向 `non_tensor_batch` 注入 `perturbation_level` / `group_id`。
+- `run_exp4.py` 在 Ray actor `__init__` 重新注册 estimator，避免跨进程丢失。
 
 ---
 
@@ -166,9 +126,7 @@ verl 的非 GRPO 路径通过 `adv_kwargs` 传入 `index(uid)`。SchemaShift est
 ├── 📚 docs/                                 # 项目文档
 │   ├── 📝 project_status.md                 # 工程进度总账
 │   ├── 📝 technical_report.md               # 技术方案与论文式说明
-│   ├── 📝 ablation_plan.md                  # 消融实验计划
-│   ├── 🖼️ figures/                          # 配图（实验跑完后回填真实数据）
-│   └── 📁 archive/                          # 历史 review、环境快照等归档
+│   └── 📝 ablation_plan.md                  # 消融实验计划
 ├── 🧪 tests/                                # 单元 / 集成测试（105 passed）
 ├── 📁 data/                                 # BFCL 原始数据 + parquet 输出
 ├── 📁 experiments/                          # 训练 ckpt 与评测输出（git 不追踪内容）
@@ -225,15 +183,47 @@ pytest tests/                # 105 passed
 
 ---
 
+## 🔥 核心结果
+
+> ⏳ 实验尚未运行，本节为待回填占位。
+> 跑完 E3 / E4 / E5 后按下表结构填入真实数据。
+
+### 主指标
+
+| 指标 | E3 Vanilla GRPO | E5 +Aug | E4 +StratAdv (Ours) | Δ vs E3 |
+|------|-----------------|---------|---------------------|---------|
+| `pass@1(none)`         | TBD | TBD | TBD | TBD |
+| `pass@1(mild)`         | TBD | TBD | TBD | TBD |
+| `pass@1(strong)`       | TBD | TBD | TBD | TBD |
+| `robust_avg`           | TBD | TBD | TBD | TBD |
+| `robustness_gap` (↓)   | TBD | TBD | TBD | TBD |
+
+> 指标定义见 [`docs/ablation_plan.md`](./docs/ablation_plan.md) §4。
+
+### 训练曲线
+
+> 待 E3 / E4 / E5 正式训练完成后回填。
+
+### 假设验证
+
+| # | 假设 | 比较 | 状态 |
+|---|------|------|------|
+| H1 | GRPO 放大 schema 过拟合 | E3 vs E2 | ⏳ 待验证 |
+| H2 | Schema Aug 降低 robustness gap | E5 vs E3 | ⏳ 待验证 |
+| H3 | StratAdv 进一步提升 | E4 vs E5 | ⏳ 待验证 |
+| H4 | 联合方案 > 最优基线 | E4 vs max(E3, E6) | ⏳ 待验证 |
+
+> 假设来源与判据见 [`docs/ablation_plan.md`](./docs/ablation_plan.md) §3。
+
+---
+
 ## 📚 文档
 
 | 📄 文档 | 📝 内容 |
 |---------|---------|
-| [`docs/project_status.md`](./docs/project_status.md) | **工程进度总账**：每日修复链、smoke 验证记录、未完事项 |
-| [`docs/technical_report.md`](./docs/technical_report.md) | **技术方案**：动机、方法、消融设计、假设与验证路径 |
-| [`docs/ablation_plan.md`](./docs/ablation_plan.md) | **消融实验计划**：E1–E6 排期、资源预算、产出物清单 |
-| [`docs/archive/review.md`](./docs/archive/review.md) | 历史 review：版本契约、设计回顾 |
-| [`CLAUDE.md`](./CLAUDE.md) | Agent 协作约定（项目规范、红线、命名规则） |
+| [`docs/project_status.md`](./docs/project_status.md) | 工程进度总账：问题、方法、修复链、smoke 验证记录 |
+| [`docs/technical_report.md`](./docs/technical_report.md) | 技术方案：BFCL 兼容修复、扰动器规则、StratAdv 公式与边界 |
+| [`docs/ablation_plan.md`](./docs/ablation_plan.md) | 消融实验矩阵：E1–E6 设计、消融链、reward / eval 约定 |
 
 ---
 
@@ -250,17 +240,12 @@ pytest tests/                # 105 passed
 
 ## 🙏 致谢
 
-- [veRL](https://github.com/volcengine/verl) —— 开源 RL 训练框架
+- [veRL](https://github.com/volcengine/verl) —— RL 训练框架
 - [BFCL / Gorilla](https://gorilla.cs.berkeley.edu/leaderboard.html) —— 多轮 function calling 评测基准
-- [Qwen](https://github.com/QwenLM/Qwen) —— 强大的开源基座模型
-- [agentic-grpo-longhorizon](https://github.com/qiqihezh/agentic-grpo-longhorizon) —— 项目结构与 README 风格的参考来源
+- [Qwen](https://github.com/QwenLM/Qwen) —— 基座模型
 
 ---
 
 ## 📜 许可
 
-MIT License. 个人研究用途，不附带任何明示或暗示的担保。
-
----
-
-> **为什么重要**：当前主流 RLHF / RLAIF 工作聚焦单轮问答或代码生成，但**多轮、多工具、schema 易变**的 function calling 场景里，vanilla GRPO 会因群组饱和与 schema 表面形式过拟合而失效。SchemaShift-GRPO 把"鲁棒性"问题分解为可工程化的"信号源 + 信号通路"，提供一条无需额外 reward model、可解释、轻量的鲁棒训练路径，对 MCP / OpenAPI / 工具调用类 RL 任务具备直接迁移价值。
+MIT License.
