@@ -1,0 +1,31 @@
+# SchemaShift-GRPO 环境依赖
+# 与 pyproject.toml 保持一致
+
+# 核心
+torch>=2.7.0
+numpy>=1.26.0
+PyYAML>=6.0
+pydantic>=2.0
+loguru>=0.7.0
+
+# 数据处理
+huggingface_hub>=0.20.0
+pyarrow>=14.0
+pandas>=2.0
+datasets>=2.14.0
+transformers>=4.40.0
+
+# 训练
+wandb>=0.15
+
+# 测试
+pytest>=8.0
+
+# 可选：verl + vLLM（RL 训练用，需要 CUDA 12.6+）
+# pip install vllm>=0.6.0
+# pip install verl>=0.6.1
+# pip install ray>=2.10
+
+# 可选：BFCL eval checker（评估用）
+# git clone https://github.com/ShishirPatil/gorilla.git
+# cd gorilla/berkeley-function-call-leaderboard && pip install -e .
