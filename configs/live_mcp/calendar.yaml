@@ -1,0 +1,58 @@
+# Calendar MCP Server 配置
+# 提供日历事件的 CRUD 操作，用于 live MCP 训练/评测
+
+name: calendar
+type: local_subprocess
+enabled: true
+
+command:
+  argv: ["python", "-m", "src.live_mcp.servers.calendar.server"]
+  cwd: "."  # 项目根目录
+  env:
+    PYTHONUNBUFFERED: "1"
+
+transport:
+  kind: stdio  # subprocess stdio 通信
+  startup_timeout_s: 20  # server 启动超时
+  request_timeout_s: 10  # 单次请求超时
+
+session:
+  reset_mode: deterministic_seed  # 每次 reset 恢复到确定性初始状态
+  max_sessions: 64  # 最大并发 session 数
+  default_seed: 42
+
+tools:
+  discovery:  # 用于 schema 发现的工具
+    - list_events
+  readonly:  # 只读工具（不改变状态）
+    - list_events
+  mutating:  # 写入工具（改变状态）
+    - create_event
+    - update_event
+    - delete_event
+
+sampler:
+  class_path: src.live_mcp.sampler.CalendarSampler  # 任务采样器
+
+reward_profile: calendar_basic  # reward 配置 profile
+
+dependency_graph:
+  edges:
+    - source_tool: list_events
+      target_tool: update_event
+      relation: explicit  # list 返回的 event_id 用于 update
+      source_output_path: events[].event_id
+      target_argument_path: event_id
+    - source_tool: list_events
+      target_tool: delete_event
+      relation: explicit
+      source_output_path: events[].event_id
+      target_argument_path: event_id
+    - source_tool: create_event
+      target_tool: list_events
+      relation: implicit  # create 后 list 应能看到新事件
+      description: created event should become visible in later listing
+
+query_templates:
+  calendar_update_existing_event:
+    - "Update {title} from {old_time} to {new_time}, then tell me the new time."

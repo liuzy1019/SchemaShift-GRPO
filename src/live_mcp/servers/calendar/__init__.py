@@ -1,0 +1,1 @@
+"""Calendar Live MCP server."""

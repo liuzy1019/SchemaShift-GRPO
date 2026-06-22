@@ -1,0 +1,1 @@
+"""Shopping Live MCP server."""

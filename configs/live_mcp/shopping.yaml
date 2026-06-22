@@ -1,0 +1,59 @@
+# Shopping MCP Server 配置
+# 提供商品搜索、购物车、下单操作，用于 live MCP 训练/评测
+
+name: shopping
+type: local_subprocess
+enabled: true
+
+command:
+  argv: ["python", "-m", "src.live_mcp.servers.shopping.server"]
+  cwd: "."
+  env:
+    PYTHONUNBUFFERED: "1"
+
+transport:
+  kind: stdio
+  startup_timeout_s: 20
+  request_timeout_s: 10
+
+session:
+  reset_mode: deterministic_seed
+  max_sessions: 64
+  default_seed: 42
+
+tools:
+  discovery:
+    - search_products
+  readonly:
+    - search_products
+    - get_order
+  mutating:
+    - add_to_cart
+    - remove_from_cart
+    - checkout
+
+sampler:
+  class_path: src.live_mcp.sampler.ShoppingSampler
+
+reward_profile: shopping_basic
+
+dependency_graph:
+  edges:
+    - source_tool: search_products
+      target_tool: add_to_cart
+      relation: explicit  # search 返回的 product_id 用于加购
+      source_output_path: products[].product_id
+      target_argument_path: product_id
+    - source_tool: add_to_cart
+      target_tool: checkout
+      relation: implicit  # checkout 需要购物车非空
+      description: checkout requires non-empty cart
+    - source_tool: checkout
+      target_tool: get_order
+      relation: explicit  # checkout 返回 order_id 用于查询
+      source_output_path: order_id
+      target_argument_path: order_id
+
+query_templates:
+  shopping_buy_product:
+    - "Find a {category} under {max_price} dollars, add it to the cart, and checkout. Tell me the order id."

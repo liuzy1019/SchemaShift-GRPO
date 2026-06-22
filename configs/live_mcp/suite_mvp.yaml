@@ -1,0 +1,39 @@
+# Live MCP MVP 套件配置
+# 默认 backend=replay，不会误接正式训练链路
+
+suite_name: live_mcp_mvp
+servers:
+  - configs/live_mcp/calendar.yaml  # 日历 server
+  - configs/live_mcp/shopping.yaml  # 购物 server
+
+environment:
+  backend: replay  # replay | live（默认 replay，避免误触 live 训练）
+
+replay:
+  episode_seeds_path: data/toucan/episode_seeds.jsonl
+
+live:
+  suite: configs/live_mcp/suite_mvp.yaml
+  transport: subprocess_stdio  # stdio 子进程通信
+  task_file: data/live_mcp/tasks/live_mcp_mvp.jsonl
+  trace_dir: data/live_mcp/traces
+
+rollout:
+  max_turns: 8  # 单 episode 最大交互轮数
+  max_parallel_tool_calls: 4  # 并行 tool call 上限
+  observation_max_chars: 4096  # 工具返回截断长度
+  stop_on_execution_error: false  # 执行错误不中断 episode
+
+reward:
+  profile: mvp_default
+  weights:
+    validity: 0.25  # 格式合法性
+    coverage: 0.25  # 工具覆盖率
+    efficiency: 0.10  # 调用效率
+    tool_selection: 0.20  # 工具选择正确性
+    argument_value: 0.20  # 参数值正确性
+
+trace:
+  output_dir: data/live_mcp/traces
+  save_success: true  # 保存成功 trace
+  save_failure: true  # 保存失败 trace（用于分析）

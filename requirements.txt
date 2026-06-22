@@ -1,0 +1,57 @@
+# SchemaShift-GRPO dependencies for the verified L20 stack.
+#
+# L20 server:
+#   nvcc 12.9.86 / CUDA Toolkit 12.9
+#   PyTorch is installed from the official cu128 wheel index.
+#
+# Install torch first, then this file:
+#   python -m pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+#     --index-url https://download.pytorch.org/whl/cu128
+#   python -m pip install -r requirements.txt --no-build-isolation
+#
+# flash-attn is built separately after torch is installed.
+# verl is installed from ./verl editable.
+
+# 核心
+numpy>=1.26.4
+PyYAML==6.0.3
+pydantic==2.12.5
+loguru==0.7.3
+packaging==25.0
+einops>=0.8.0
+scipy>=1.13.0
+safetensors==0.7.0
+
+# 配置（hydra 用于 GRPO 训练入口）
+hydra-core==1.3.3
+omegaconf>=2.3.0
+
+# 数据
+huggingface_hub==0.36.2
+pyarrow==23.0.1
+pandas>=2.2.3
+datasets==4.8.4
+transformers==4.57.6
+tokenizers==0.22.2
+protobuf>=5.29.6
+
+# SFT
+trl==0.29.1
+peft==0.18.1
+accelerate==1.13.0
+tensorboard==2.20.0
+wandb==0.26.0
+
+# RL
+vllm==0.11.0
+ray==2.54.1
+tensordict==0.10.0
+xformers==0.0.32.post1
+deepspeed==0.19.2
+flashinfer-python==0.6.4
+lm-format-enforcer==0.11.3
+compressed-tensors==0.11.0
+xgrammar==0.1.25
+
+# 测试
+pytest==9.1.0
