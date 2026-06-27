@@ -33,9 +33,6 @@ tools:
     - transition_issue
     - comment_issue
 
-sampler:
-  class_path: src.live_mcp.sampler.IssueTrackerSampler
-
 reward_profile: issue_tracker_basic
 
 dependency_graph:

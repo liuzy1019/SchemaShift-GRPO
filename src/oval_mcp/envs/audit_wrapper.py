@@ -118,9 +118,12 @@ class AuditWrapper:
         if operation == "delete" and target_id:
             # Save the entity data before it was deleted
             if pre_state:
-                events = pre_state.get("events", {})
-                if isinstance(events, dict) and target_id in events:
-                    self._deleted_entities[session_id][target_id] = dict(events[target_id])
+                # Unwrap domain-keyed state (consistent with audit_step_with_state)
+                domain_state = pre_state.get(self.adapter.domain_name, pre_state)
+                container_key = getattr(self.adapter, "entity_container_key", "events")
+                entities = domain_state.get(container_key, {}) if isinstance(domain_state, dict) else {}
+                if isinstance(entities, dict) and target_id in entities:
+                    self._deleted_entities[session_id][target_id] = dict(entities[target_id])
                 else:
                     self._deleted_entities[session_id][target_id] = {}
             else:

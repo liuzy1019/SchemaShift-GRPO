@@ -104,7 +104,10 @@ class FoodDeliveryServer(StatefulToolServer):
 
     def cancel_order(self, session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
         state = self._state(session_id); oid = arguments["order_id"]; order = self._order(state, oid)
-        if order["status"] in ("preparing", "delivering", "delivered"): raise KeyError(f"cannot cancel order in status: {order['status']}")
+        # Derive uncancellable states from LIFECYCLE to stay in sync
+        uncancellable = {s for s, allowed in LIFECYCLE.items() if "cancelled" not in allowed}
+        if order["status"] in uncancellable:
+            raise KeyError(f"cannot cancel order in status: {order['status']}")
         if order["status"] == "cancelled": raise KeyError("order already cancelled")
         order["status"] = "cancelled"; order["cancel_reason"] = arguments.get("reason", "")
         return _result(True, {"order": order}, None, "", True)

@@ -44,7 +44,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--val-count", type=int, default=50,
                     help="Number of validation tasks to generate")
     p.add_argument("--domain", default="all",
-                    help="Domain (all, banking, calendar, etc.)")
+                    help="Domain (all, banking, calendar, etc.). "
+                         "Comma-separated list supported, e.g. calendar,shopping,banking")
     p.add_argument("--model", required=True,
                     help="Model name (vLLM served name) or local path (models/Qwen/Qwen3-8B). "
                          "vLLM mode: must match --served-model-name from vLLM startup. "
@@ -64,9 +65,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Probability of injecting distractor tools (0 to disable)")
     p.add_argument("--missing-function-rate", type=float, default=0.20,
                     help="Probability of hiding a required tool (0 to disable)")
+    p.add_argument("--device", type=int, default=None,
+                    help="GPU device ID for local inference (default: auto). "
+                         "Use with CUDA_VISIBLE_DEVICES for multi-GPU data-parallel via "
+                         "scripts/generate_data_parallel.sh")
     p.add_argument("--experiment-tag", default=None,
                     help="Tag for experiment tracking. If set, writes config.json and "
                          "result.json to data/experiments/{YYYY-MM-DD}_{tag}/")
+    p.add_argument("--log-file", default=None,
+                    help="Write all logs to this file (auto-flushed, avoids pipe buffering)")
     return p
 
 
@@ -74,8 +81,21 @@ def generate_data(args: argparse.Namespace):
     """Generate GRPO training data with LLM teacher."""
     from src.live_mcp.api import LiveMCPBranch
 
+    # 如果指定了 --log-file，添加文件 sink 确保实时可见
+    if args.log_file:
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            str(log_path),
+            level="DEBUG",
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+            enqueue=False,
+            catch=True,
+        )
+
     start_time = datetime.now(timezone.utc)
 
+    print(f"[generate_data] Target: {args.count} train + {args.val_count} val tasks, domain={args.domain}, model={args.model}")
     logger.info(f"Generating GRPO data: {args.count} train + {args.val_count} val tasks")
     logger.info(f"  Domain: {args.domain}")
     logger.info(f"  Model: {args.model}")
@@ -86,22 +106,28 @@ def generate_data(args: argparse.Namespace):
 
     try:
         branch.start()
+        print(f"[generate_data] Generating {args.count} train tasks...", flush=True)
         train_tasks = branch.generate_tasks_llm(
             server_name=args.domain, count=args.count, seed=args.seed,
             difficulty_mix=difficulty_mix, model_path=args.model,
             api_base=args.api_base,
+            device=args.device,
             irrelevance_ratio=args.irrelevance_ratio,
             distractor_rate=args.distractor_rate,
             missing_function_rate=args.missing_function_rate,
         )
+        print(f"[generate_data] Train done: {len(train_tasks)} tasks", flush=True)
+        print(f"[generate_data] Generating {args.val_count} val tasks...", flush=True)
         val_tasks = branch.generate_tasks_llm(
             server_name=args.domain, count=args.val_count, seed=args.seed + 10000,
             difficulty_mix=difficulty_mix, model_path=args.model,
             api_base=args.api_base,
+            device=args.device,
             irrelevance_ratio=args.irrelevance_ratio,
             distractor_rate=args.distractor_rate,
             missing_function_rate=args.missing_function_rate,
         )
+        print(f"[generate_data] Val done: {len(val_tasks)} tasks", flush=True)
         all_rows = _tasks_to_rows(train_tasks, args.seed)
         val_rows = _tasks_to_rows(val_tasks, args.seed + 10000)
     finally:
@@ -125,6 +151,11 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
         # Determine visible tools — use task-provided tools, fall back to required
         visible_tools = task.visible_tools if task.visible_tools else []
         if not visible_tools:
+            logger.warning(
+                f"Skipping task {task.task_id}: no visible_tools "
+                f"(required_tools={task.required_tools}, "
+                f"oracle_calls={len(task.oracle_program.calls) if task.oracle_program else 0})"
+            )
             continue  # Skip tasks without tool schemas
 
         tools_desc_lines = []

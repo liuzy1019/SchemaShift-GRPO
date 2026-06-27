@@ -1,3 +1,3 @@
-from .schemashift_oval_loop import SchemaShiftOvalLoop
+from .livemcp_oval_loop import LiveMCPOvalLoop
 
-__all__ = ["SchemaShiftOvalLoop"]
+__all__ = ["LiveMCPOvalLoop"]

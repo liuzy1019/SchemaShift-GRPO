@@ -83,7 +83,7 @@ git diff --check
 ## Git 约定
 
 ```text
-远端: https://github.com/liuzy1019/SchemaShift-GRPO
+远端: https://github.com/liuzy1019/LiveMCP-GRPO
 主分支: main
 author: liuzy1019 <liuzy1019@buaa.edu.cn>
 ```
@@ -105,6 +105,6 @@ Conventional Commits：`<type>: <subject>`
 ## 已核验注意事项
 
 - 当前 policy 模型为 Qwen3-4B（`models/Qwen3-4B`），LLM Teacher 使用 Qwen3-8B（`models/Qwen3-8B`），计划升级到 Qwen3-32B-Instruct
-- OVAL GRPO 是主训练路线（`src/training/run_grpo.py`），使用 `SchemaShiftOvalLoop` + `oval_reward_fn.py`
+- OVAL GRPO 是主训练路线（`src/training/run_grpo.py`），使用 `LiveMCPOvalLoop` + `oval_reward_fn.py`
 - SFT cold-start 相关代码已清除（`scripts/sft_cold_start.py`、`configs/sft_cold_start_4b.yaml`）
 - GRPO 训练默认环境为 8×L20 44GB

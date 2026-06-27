@@ -130,6 +130,7 @@ class ProcessScorer:
     _PREDICATE_BONUS_MAP: dict[str, str] = {
         "resolved_required_entity": "B_resolve_required_entity",
         "satisfied_dependency_edge": "B_satisfy_dependency_edge",
+        "preserve_required_identity": "B_preserve_required_identity",
         "completed_required_transition": "B_complete_required_transition",
         "verified_postcondition": "B_verify_postcondition",
         "produced_required_response": "B_recover_from_tool_error",

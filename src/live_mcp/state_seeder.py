@@ -162,7 +162,7 @@ def _team_chat_state(seed: int) -> dict[str, Any]:
         ]},
         "ch_archived": {"channel_id": "ch_archived", "name": "old-project", "description": "Archived project channel", "members": ["alice"], "archived": True, "messages": []},
     }
-    return {"channels": channels, "threads": {}, "dms": [], "next_msg_num": 4, "next_thread_num": 1}
+    return {"channels": channels, "threads": {}, "dms": [], "next_msg_num": 4, "next_thread_num": 1, "next_ch_num": len(channels) + 1}
 
 
 def _food_delivery_state(seed: int) -> dict[str, Any]:

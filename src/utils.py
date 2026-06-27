@@ -44,3 +44,50 @@ def normalize_json_field(value: Any, default: Any = None) -> Any:
         except (json.JSONDecodeError, TypeError, ValueError):
             return default
     return value if value is not None else default
+
+
+def strip_think_tags(text: str) -> str:
+    """Strip Qwen3 <think>...</think> blocks from model output.
+
+    Handles both closed tags and unclosed (dangling) <think> tags.
+    """
+    import re
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    if "<think>" in text:
+        after_think = re.sub(r"<think>[\s\S]+", "", text)
+        text = after_think.strip() if after_think.strip() else ""
+    return text.strip()
+
+
+def extract_json(text: str) -> dict[str, Any]:
+    """从 LLM 输出中提取 JSON 对象，处理 markdown fences 和 think 标签。
+
+    供 task_planner 和 llm_client 复用。
+    """
+    import re
+
+    text = strip_think_tags(text)
+
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try markdown code fence
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # Try to find JSON object boundaries (greedy)
+    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if brace_match:
+        try:
+            return json.loads(brace_match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"Could not extract valid JSON from: {text[:200]}...")

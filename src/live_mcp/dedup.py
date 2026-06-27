@@ -14,10 +14,10 @@ from src.live_mcp.types import LiveTask
 def jaccard_similarity(a: LiveTask, b: LiveTask) -> float:
     """Jaccard similarity between two tasks' oracle tool call signatures.
 
-    Each task is represented as the set of (tool_name, frozenset(arg_keys))
+    Each task is represented as the set of (tool_name, frozenset(key=value))
     pairs from its oracle program.  This captures both *which* tools are
-    called and *what arguments* they receive, without being sensitive to
-    specific argument values.
+    called and *with what arguments*, so tasks targeting different entities
+    or using different parameter values are correctly distinguished.
 
     Returns a float in [0.0, 1.0].
     """
@@ -67,9 +67,19 @@ def dedup_tasks(
 
 
 def _call_signatures(task: LiveTask) -> set[tuple[str, frozenset[str]]]:
-    """Build set of (tool_name, frozenset(arg_keys)) pairs from oracle calls."""
+    """Build set of (tool_name, frozenset(key=value)) pairs from oracle calls.
+
+    Includes argument *values* so that tasks targeting different entities
+    or using different parameter values produce distinct signatures.
+    This allows Jaccard similarity to correctly distinguish:
+      - Different entities: transfer(from=savings, to=checking) ≠ transfer(from=checking, to=savings)
+      - Same entity:   two tasks with identical tool calls → true duplicate → dedup
+    """
     sigs: set[tuple[str, frozenset[str]]] = set()
     for call in task.oracle_program.calls:
-        arg_keys = frozenset(call.arguments.keys()) if call.arguments else frozenset()
-        sigs.add((call.tool_name, arg_keys))
+        parts: list[str] = []
+        if call.arguments:
+            for k, v in sorted(call.arguments.items()):
+                parts.append(f"{k}={v}")
+        sigs.add((call.tool_name, frozenset(parts)))
     return sigs

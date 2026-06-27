@@ -31,7 +31,11 @@ class TeamChatServer(StatefulToolServer):
         return _result(True, {"channels": channels, "count": len(channels)}, None, "", False)
 
     def create_channel(self, session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        state = self._state(session_id); cid = f"ch_{arguments['name'].replace(' ', '_').lower()}"
+        state = self._state(session_id)
+        # Use incrementing counter + name hash for unique IDs, avoiding case/whitespace collisions
+        base = arguments['name'].replace(' ', '_').lower()
+        cid = f"ch_{state['next_ch_num']:03d}_{base}"
+        state["next_ch_num"] += 1
         if cid in state["channels"]: raise KeyError(f"channel already exists: {cid}")
         ch = {"channel_id": cid, "name": arguments["name"], "members": arguments.get("members", ["current_user"]), "description": arguments.get("description", ""), "archived": False, "messages": []}
         state["channels"][cid] = ch

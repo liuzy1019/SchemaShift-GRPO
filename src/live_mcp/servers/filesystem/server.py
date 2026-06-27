@@ -189,12 +189,21 @@ class FilesystemServer(StatefulToolServer):
 
     def mv(self, session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
         state = self._state(session_id); src = self._resolve(session_id, arguments["source"]); dst = self._resolve(session_id, arguments["target"])
-        # Check protected path BEFORE popping source to avoid data loss
+        # Check protected path on both source and destination
         if self._protected_prefix in src:
             raise KeyError("cannot move protected paths")
+        if self._protected_prefix in dst:
+            raise KeyError("cannot move into protected paths")
         node = state["fs"].pop(src, None)
         if not node: raise KeyError(f"source not found: {src}")
-        state["fs"][dst] = node; return _result(True, {"source": src, "target": dst}, None, "", True)
+        state["fs"][dst] = node
+        # Move all children if source was a directory
+        if node["type"] == "dir":
+            for child in list(self._children(state, src)):
+                child_dst = dst + child[len(src):]
+                child_node = state["fs"].pop(child, None)
+                if child_node: state["fs"][child_dst] = child_node
+        return _result(True, {"source": src, "target": dst}, None, "", True)
 
     def cp(self, session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
         state = self._state(session_id); src = self._resolve(session_id, arguments["source"]); dst = self._resolve(session_id, arguments["target"])
@@ -203,7 +212,9 @@ class FilesystemServer(StatefulToolServer):
         state["fs"][dst] = copy.deepcopy(node)
         # Recursively copy children if dir
         if node["type"] == "dir" and arguments.get("recursive"):
-            for child in self._children(state, src): self.cp(session_id, {"source": child, "target": dst + "/" + child.split("/")[-1]})
+            for child in self._children(state, src):
+                child_dst = dst + "/" + child.split("/")[-1]
+                self.cp(session_id, {"source": child, "target": child_dst, "recursive": True})
         return _result(True, {"source": src, "target": dst}, None, "", True)
 
     def rm(self, session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -212,9 +223,19 @@ class FilesystemServer(StatefulToolServer):
         if not node: raise KeyError(f"path not found: {path}")
         if self._protected_prefix in path: raise KeyError("cannot delete protected paths")
         if node["type"] == "dir":
-            kids = self._children(state, path)
+            kids = list(self._children(state, path))
             if kids and not arguments.get("recursive"): raise KeyError(f"directory not empty: {path}")
-            for k in kids: state["fs"].pop(k, None)
+            if arguments.get("recursive"):
+                # Recursively collect all descendants for removal
+                all_descendants = list(kids)
+                stack = list(kids)
+                while stack:
+                    child = stack.pop()
+                    if state["fs"].get(child, {}).get("type") == "dir":
+                        grandchildren = list(self._children(state, child))
+                        all_descendants.extend(grandchildren)
+                        stack.extend(grandchildren)
+                for k in reversed(all_descendants): state["fs"].pop(k, None)
         state["fs"].pop(path, None); return _result(True, {"path": path, "deleted": True}, None, "", True)
 
     # Permissions
@@ -333,10 +354,15 @@ class FilesystemServer(StatefulToolServer):
         result = []
         for l in lines:
             try:
-                if expr.startswith("s/"):
+                if expr.startswith("s/") and len(l) <= 10000:  # length guard for ReDoS
                     parts = expr[2:].rsplit("/", 2)
-                    if len(parts) >= 3: l = re.sub(parts[0], parts[1], l)
-            except Exception: pass
+                    if len(parts) >= 3:
+                        l = re.sub(parts[0], parts[1], l, count=0)
+                        # Fall back to no-op on likely catastrophic backtracking
+            except re.error:
+                pass
+            except Exception:
+                pass
             result.append(l)
         return _result(True, {"result": result}, None, "", False)
 

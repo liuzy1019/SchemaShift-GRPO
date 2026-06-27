@@ -37,9 +37,6 @@ tools:
     - rm
     - chmod
 
-sampler:
-  class_path: src.live_mcp.sampler.FilesystemSampler
-
 reward_profile: filesystem_basic
 
 dependency_graph:

@@ -29,6 +29,7 @@ from typing import Any
 from loguru import logger
 
 from src.live_mcp.types import OracleCall
+from src.utils import extract_json as _extract_json
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -196,8 +197,11 @@ Output ONLY the JSON, nothing else:
                 query = data.get("user_query", "")
                 if query:
                     return query
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    f"generate_query attempt {attempt + 1}/3 failed for "
+                    f"{self.domain}: {type(e).__name__}: {e}"
+                )
         raise RuntimeError(f"Failed to generate query for {self.domain}")
 
     # ── Step 2-N: decide next action (LLM-in-the-loop) ──
@@ -217,6 +221,18 @@ Output ONLY the JSON, nothing else:
         """
         tools_text = _format_tools(tool_schemas, strip_enums=self._strip_enums)
         history_text = _format_history(execution_history)
+
+        # First-turn guidance: prevent LLM from answering without tools
+        if not execution_history:
+            first_turn_hint = (
+                "\nIMPORTANT: This is your FIRST turn. You MUST call a tool before answering.\n"
+                "Do NOT use final_answer - you have not checked any data yet.\n"
+                "Look at the user task, choose the most relevant tool, and call it with appropriate arguments.\n"
+            )
+            default_action = "tool_call"
+        else:
+            first_turn_hint = ""
+            default_action = "final_answer"
 
         system = (
             "You are controlling tools to complete a user task. "
@@ -250,7 +266,7 @@ Decide the NEXT action. Output ONE JSON object:
 
 - To ask the user for missing information:
   {{"action": "ask_clarification", "question": "<what you need>"}}
-
+{first_turn_hint}
 Output ONLY the JSON, nothing else:
 """
         for _retry in range(3):
@@ -261,14 +277,25 @@ Output ONLY the JSON, nothing else:
                     temperature=0.7 + 0.1 * attempt,
                 )
                 data = _extract_json(raw)
+                action = data.get("action", default_action)
+                # On first turn, reject non-tool_call actions — LLM must use tools
+                if not execution_history and action != "tool_call":
+                    logger.debug(
+                        f"decide_action first turn rejected '{action}' for {self.domain}, "
+                        f"retrying (attempt {_retry + 1}/3)"
+                    )
+                    continue
                 return ActionPlan(
-                    action=data.get("action", "final_answer"),
+                    action=action,
                     tool_name=data.get("tool_name", ""),
                     arguments=data.get("arguments", {}),
                     text=data.get("text", data.get("reason", data.get("question", ""))),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    f"decide_action attempt {_retry + 1}/3 failed for "
+                    f"{self.domain}: {type(e).__name__}: {e}"
+                )
         raise RuntimeError(
             f"decide_action failed after 3 attempts for {self.domain} — "
             f"LLM could not produce a valid decision"
@@ -279,26 +306,179 @@ Output ONLY the JSON, nothing else:
 # Execution perturbations (PROVE-style robustness)
 # ═══════════════════════════════════════════════════════════════════════
 
+# Domain → perturbation group mapping, per PROVE §6 step 5a
+_DOMAIN_PERTURBATION_GROUP = {
+    # PROVE mappings
+    "filesystem":    "filesystem_terminal",
+    "calendar":      "calendar_crm",
+    "crm":           "calendar_crm",
+    "email":         "email_teamchat",
+    "team_chat":     "email_teamchat",
+    "shopping":      "search_shopping",
+    # Extended mappings (closest PROVE category)
+    "banking":       "transactional",
+    "payments":      "transactional",
+    "food_delivery": "lifecycle",
+    "issue_tracker": "workflow",
+}
+
+_PERTURBATION_SPEC = {
+    "filesystem_terminal": ["intermittent_api_error", "partial_batch_failure"],
+    "calendar_crm":        ["intermittent_api_error", "partial_batch_failure"],
+    "email_teamchat":      ["paginated_response", "partial_batch_failure"],
+    "search_shopping":     ["paginated_response", "incomplete_intermediate"],
+    "transactional":       ["intermittent_api_error", "partial_batch_failure"],
+    "lifecycle":           ["intermittent_api_error", "partial_batch_failure"],
+    "workflow":            ["intermittent_api_error", "partial_batch_failure"],
+}
+
+# Per-type probability (~0.10 each, total ~0.20 within PROVE 0.15–0.30)
+_PERTURBATION_PROB = {
+    "intermittent_api_error":   0.10,
+    "paginated_response":       0.10,
+    "incomplete_intermediate":  0.10,
+    "partial_batch_failure":    0.10,
+}
+
+
+def _perturb_intermittent_api_error(
+    observation: dict[str, Any] | str | None,
+    rng: random.Random,
+) -> dict[str, Any] | str | None:
+    """Return internal server error → oracle retries the same call."""
+    return {"error": "Internal Server Error", "retry": True}
+
+
+def _perturb_paginated_response(
+    observation: dict[str, Any] | str | None,
+    rng: random.Random,
+) -> dict[str, Any] | str | None:
+    """Wrap partial results with a cursor → oracle must paginate."""
+    if not isinstance(observation, dict):
+        return None
+    items = observation.get("items", observation.get("results", []))
+    if isinstance(items, list) and len(items) > 1:
+        mid = max(1, len(items) // 2)
+        return {**observation, "items": items[:mid], "next_cursor": "page_2"}
+    return None
+
+
+def _perturb_incomplete_intermediate(
+    observation: dict[str, Any] | str | None,
+    rng: random.Random,
+) -> dict[str, Any] | str | None:
+    """Return snippets instead of full details → oracle must extract/get detail.
+
+    PROVE: intermediate search results only show summaries, forcing
+    subsequent extract/detail calls to retrieve complete information.
+    """
+    if not isinstance(observation, dict):
+        return None
+    result_keys = ("items", "results", "matches", "entries", "records")
+    if not any(k in observation for k in result_keys):
+        return None
+    total = 0
+    for k in result_keys:
+        v = observation.get(k)
+        if isinstance(v, list):
+            total = len(v)
+            break
+    if total < 2:
+        return None
+    summary = {
+        "summary": "Partial results returned. Use get_detail / extract / get_item "
+                   "to retrieve complete information.",
+        "snippet_count": min(total, rng.randint(1, 3)),
+        "requires_detail_fetch": True,
+    }
+    for k in ("total", "count", "next_cursor", "cursor"):
+        if k in observation:
+            summary[k] = observation[k]
+    return summary
+
+
+def _perturb_partial_batch_failure(
+    observation: dict[str, Any] | str | None,
+    rng: random.Random,
+) -> dict[str, Any] | str | None:
+    """Mark a subset of batch results as failed → oracle must retry individually.
+
+    PROVE: bulk updates where some items fail. The model must inspect results
+    and re-process failed items one by one.
+    """
+    if not isinstance(observation, dict):
+        return None
+    batch_keys = ("results", "updated", "processed", "created")
+    batch_key = None
+    items = []
+    for k in batch_keys:
+        v = observation.get(k)
+        if isinstance(v, list) and len(v) > 1:
+            batch_key = k
+            items = v
+            break
+    if not items:
+        return None
+    fail_count = max(1, len(items) // 3)
+    fail_indices = rng.sample(range(len(items)), fail_count)
+    new_items = list(items)
+    for idx in fail_indices:
+        if isinstance(new_items[idx], dict):
+            new_items[idx] = {
+                **new_items[idx],
+                "status": "failed",
+                "error": "Transient processing failure — retry required",
+            }
+    return {**observation, batch_key: new_items, "partial_failure": True, "failed_count": fail_count}
+
+
+_PERTURBATION_HANDLERS = {
+    "intermittent_api_error":   _perturb_intermittent_api_error,
+    "paginated_response":       _perturb_paginated_response,
+    "incomplete_intermediate":  _perturb_incomplete_intermediate,
+    "partial_batch_failure":    _perturb_partial_batch_failure,
+}
+
+
 def apply_perturbation(
     observation: dict[str, Any] | str | None,
     domain: str,
     rng: random.Random,
 ) -> dict[str, Any] | str | None:
-    """Optionally perturb an execution result to simulate real-world noise.
+    """Apply domain-specific execution perturbation (PROVE-style).
 
-    PROVE-style perturbations (15-30% probability per call):
-      - intermittent_api_error:   return error message → oracle retries
-      - paginated_response:       wrap partial results with cursor
-      - incomplete_intermediate:  return summary instead of full details
+    Total perturbation probability: ~0.20 per tool call (PROVE: 0.15–0.30).
+
+    Perturbation types (per domain group):
+
+    ======================  ==============================================  ============================
+    Domain group             Domains                                         Perturbation types
+    ======================  ==============================================  ============================
+    filesystem_terminal      filesystem                                      intermittent, partial_batch
+    calendar_crm             calendar, crm                                   intermittent, partial_batch
+    email_teamchat           email, team_chat                                paginated, partial_batch
+    search_shopping          shopping                                        paginated, incomplete
+    transactional            banking, payments                               intermittent, partial_batch
+    lifecycle                food_delivery                                   intermittent, partial_batch
+    workflow                 issue_tracker                                   intermittent, partial_batch
+    ======================  ==============================================  ============================
+
+    Each applicable type is rolled independently at ~0.10 probability.
+    Types that don't match the observation structure silently skip
+    (e.g., paginated_response on a non-list observation does nothing).
     """
-    roll = rng.random()
-    if roll < 0.08:
-        return {"error": "Internal Server Error", "retry": True}
-    if roll < 0.16 and isinstance(observation, dict):
-        items = observation.get("items", observation.get("results", []))
-        if isinstance(items, list) and len(items) > 1:
-            mid = max(1, len(items) // 2)
-            return {**observation, "items": items[:mid], "next_cursor": "page_2"}
+    group = _DOMAIN_PERTURBATION_GROUP.get(domain, "transactional")
+    pert_types = _PERTURBATION_SPEC.get(group, ["intermittent_api_error"])
+
+    for ptype in pert_types:
+        prob = _PERTURBATION_PROB.get(ptype, 0.10)
+        if rng.random() < prob:
+            handler = _PERTURBATION_HANDLERS.get(ptype)
+            if handler:
+                result = handler(observation, rng)
+                if result is not None:
+                    return result
+
     return observation
 
 
@@ -465,32 +645,6 @@ def replay_validate(
 # ═══════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════
-
-def _extract_json(text: str) -> dict[str, Any]:
-    """Extract JSON object from LLM output, handling markdown fences and think tags."""
-    import re
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    if "<think>" in text:
-        text = re.sub(r"<think>[\s\S]+", "", text)
-    text = text.strip()
-    try:
-        return _json.loads(text)
-    except _json.JSONDecodeError:
-        pass
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-    if m:
-        try:
-            return _json.loads(m.group(1).strip())
-        except _json.JSONDecodeError:
-            pass
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        try:
-            return _json.loads(m.group(0))
-        except _json.JSONDecodeError:
-            pass
-    raise ValueError(f"Could not extract JSON from: {text[:200]}")
-
 
 def _format_tools(tool_schemas: list[dict[str, Any]], strip_enums: bool = False) -> str:
     """Format tool schemas as human-readable text, optionally hiding enum values."""

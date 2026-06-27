@@ -35,9 +35,6 @@ tools:
     - add_label
     - move_to_thread
 
-sampler:
-  class_path: src.live_mcp.sampler.EmailSampler
-
 reward_profile: email_basic
 
 dependency_graph:

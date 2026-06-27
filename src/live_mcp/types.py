@@ -123,7 +123,20 @@ def oracle_program_from_dict(data: dict[str, Any]) -> OracleProgram:
     )
 
 
+_LIVE_TASK_REQUIRED = {
+    "task_id", "source", "suite_name", "user_prompt", "session_id",
+    "session_seed", "target_servers", "visible_tools", "required_tools",
+    "expected_outcome", "success_criteria", "oracle_program",
+    "sampling_context", "max_turns",
+}
+
+
 def live_task_from_dict(data: dict[str, Any]) -> LiveTask:
     payload = dict(data)
+    missing = _LIVE_TASK_REQUIRED - set(payload.keys())
+    if missing:
+        raise KeyError(
+            f"live_task_from_dict: missing required fields: {sorted(missing)}"
+        )
     payload["oracle_program"] = oracle_program_from_dict(payload["oracle_program"])
     return LiveTask(**payload)

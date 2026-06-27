@@ -1,7 +1,7 @@
 """
-SchemaShift Oval Agent Loop — live MCP execution with audit for verl GRPO rollout.
+LiveMCP Oval Agent Loop — live MCP execution with audit for verl GRPO rollout.
 
-与 SchemaShiftReplayLoop 的区别：
+与 LiveMCPReplayLoop 的区别：
   - Replay：使用预存的 replay_observation，不调用真实 MCP
   - Oval：使用真实 MCP server subprocess 执行，产生真实 observation + 审计事件
 
@@ -13,7 +13,7 @@ rollout 流程：
   5. 终止或 max_turns → 将 audit_events 存入 extra_fields
 
 verl 集成方式：
-  - 通过 configs/agent_loop.yaml 注册为 "schemashift_oval"
+  - 通过 configs/agent_loop.yaml 注册为 "livemcp_oval"
   - 数据中 extra_info 需要包含 task 定义（target_servers, required_tools 等）
 """
 
@@ -119,37 +119,42 @@ def _parse_terminal_type(text: str) -> str:
 
 # ── 进程级 OvalMCPWorkerContext（单例，避免每个 rollout 重启 server） ──
 
+import threading
+
 _oval_ctx: OvalMCPWorkerContext | None = None
 _oval_ctx_started: bool = False
+_oval_ctx_lock = threading.Lock()
 
 
 def _get_oval_ctx(
     suite_path: str = "configs/live_mcp/suite_mvp.yaml",
     domains: list[str] | None = None,
 ) -> OvalMCPWorkerContext:
-    """获取或创建进程级 OvalMCPWorkerContext 单例。"""
+    """获取或创建进程级 OvalMCPWorkerContext 单例（线程安全）。"""
     global _oval_ctx, _oval_ctx_started
-    if _oval_ctx is None:
-        _oval_ctx = OvalMCPWorkerContext(suite_path=suite_path, domains=domains)
-    if not _oval_ctx_started:
-        _oval_ctx.start()
-        _oval_ctx_started = True
-        logger.info("[oval] OvalMCPWorkerContext started (process-level singleton)")
+    with _oval_ctx_lock:
+        if _oval_ctx is None:
+            _oval_ctx = OvalMCPWorkerContext(suite_path=suite_path, domains=domains)
+        if not _oval_ctx_started:
+            _oval_ctx.start()
+            _oval_ctx_started = True
+            logger.info("[oval] OvalMCPWorkerContext started (process-level singleton)")
     return _oval_ctx
 
 
 def shutdown_oval_ctx() -> None:
-    """关闭进程级 OvalMCPWorkerContext（用于测试清理）。"""
+    """关闭进程级 OvalMCPWorkerContext（用于测试清理，线程安全）。"""
     global _oval_ctx, _oval_ctx_started
-    if _oval_ctx is not None and _oval_ctx_started:
-        _oval_ctx.stop()
-        _oval_ctx_started = False
-        logger.info("[oval] OvalMCPWorkerContext stopped")
+    with _oval_ctx_lock:
+        if _oval_ctx is not None and _oval_ctx_started:
+            _oval_ctx.stop()
+            _oval_ctx_started = False
+            logger.info("[oval] OvalMCPWorkerContext stopped")
 
 
-@register("schemashift_oval")
-class SchemaShiftOvalLoop(AgentLoopBase):
-    """SchemaShift Oval Agent Loop — live MCP execution with audit。
+@register("livemcp_oval")
+class LiveMCPOvalLoop(AgentLoopBase):
+    """LiveMCP Oval Agent Loop — live MCP execution with audit。
 
     rollout 流程：
     1. 模型生成 response（可能包含 <tool_call>）
@@ -187,7 +192,7 @@ class SchemaShiftOvalLoop(AgentLoopBase):
         extra_info = kwargs.get("extra_info", {})
 
         # ── normalize extra_info ──
-        from src.utils import normalize_extra_info, normalize_json_field
+        from src.utils import normalize_extra_info
         extra_info = normalize_extra_info(extra_info)
 
         # ── 获取 task 信息 ──
@@ -222,7 +227,7 @@ class SchemaShiftOvalLoop(AgentLoopBase):
             self.tokenizer = kwargs.get("tokenizer")
         if self.tokenizer is None:
             ctx.close_session(session_id)
-            raise RuntimeError("SchemaShiftOvalLoop.tokenizer is None")
+            raise RuntimeError("LiveMCPOvalLoop.tokenizer is None")
 
         # 解析 prompt
         if isinstance(raw_prompt, str):
@@ -301,7 +306,7 @@ class SchemaShiftOvalLoop(AgentLoopBase):
                         action_type=terminal_type,
                         model_output=response_text,
                     )
-                    audit_events.append(_serialize_audit_event(event))
+                    audit_events.append(event.to_dict())
                 except Exception as e:
                     logger.warning(f"[oval {rid_short}] audit terminal 失败: {e}")
                 break
@@ -344,7 +349,7 @@ class SchemaShiftOvalLoop(AgentLoopBase):
                         tool_call=tool_call,
                         model_output=response_text,
                     )
-                    audit_events.append(_serialize_audit_event(event))
+                    audit_events.append(event.to_dict())
 
                     if exec_result.success:
                         n_exec_success += 1
@@ -426,33 +431,3 @@ class SchemaShiftOvalLoop(AgentLoopBase):
             ),
         )
         return list(response_ids)
-
-
-def _serialize_audit_event(event: Any) -> dict[str, Any]:
-    """将 AuditEvent 序列化为 JSON-safe dict（使用 to_dict() 方法）。"""
-    if hasattr(event, "to_dict"):
-        return event.to_dict()
-    # fallback: 手动序列化
-    return {
-        "event_id": getattr(event, "event_id", ""),
-        "session_id": getattr(event, "session_id", ""),
-        "step": getattr(event, "step", 0),
-        "action_type": getattr(event, "action_type", ""),
-        "tool_name": getattr(event, "tool_name", ""),
-        "tool_arguments": getattr(event, "tool_arguments", {}),
-        "terminal_action": getattr(event, "terminal_action", None),
-        "operation": getattr(event, "operation", ""),
-        "target_type": getattr(event, "target_type", ""),
-        "target_id": getattr(event, "target_id", ""),
-        "before_hash": getattr(event, "before_hash", ""),
-        "after_hash": getattr(event, "after_hash", ""),
-        "changed_fields": getattr(event, "changed_fields", []),
-        "created_ids": getattr(event, "created_ids", []),
-        "deleted_ids": getattr(event, "deleted_ids", []),
-        "duplicate_of": getattr(event, "duplicate_of", None),
-        "identity_violation": getattr(event, "identity_violation", ""),
-        "forbidden_transition": getattr(event, "forbidden_transition", ""),
-        "execution_success": getattr(event, "execution_success", False),
-        "schema_valid": getattr(event, "schema_valid", False),
-        "state_changed": getattr(event, "state_changed", False),
-    }

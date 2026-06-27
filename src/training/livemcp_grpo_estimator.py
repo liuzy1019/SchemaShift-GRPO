@@ -1,7 +1,7 @@
 """
-SchemaShift-GRPO 自定义 advantage estimator。
+LiveMCP-GRPO 自定义 advantage estimator。
 
-注册为 verl 的 "schemashift_grpo" estimator。
+注册为 verl 的 "livemcp_grpo" estimator。
 优先从 non_tensor_batch（由 _get_gen_batch 保留，register_estimator.py 转发）读取
 perturbation_level、scenario_type 和 group_id，fallback 到从 uid 解析。
 
@@ -20,7 +20,7 @@ try:
     from verl.trainer.ppo.core_algos import register_adv_est
 except ImportError as e:
     raise ImportError(
-        "verl 未安装或版本不兼容，schemashift_grpo estimator 无法注册。"
+        "verl 未安装或版本不兼容，livemcp_grpo estimator 无法注册。"
         f"原始错误: {e}"
     )
 
@@ -31,13 +31,20 @@ _LATA_WARNED = False
 
 
 def _resolve_lata_mode(config) -> str:
-    """从 config 或环境变量解析 LATA 模式"""
-    # 环境变量优先（调试方便）
-    if os.environ.get("OVAL_LATA", ""):
-        return os.environ["OVAL_LATA"]
+    """从 config 或环境变量解析 LATA 模式。
+
+    优先级: LIVEMCP_LATA > OVAL_LATA > config > default "none".
+    禁用 sentinel: "0", "false", "off", "none" 均视为禁用.
+    """
+    _DISABLED = frozenset({"0", "false", "off", "none", ""})
+    # 环境变量优先（支持 LIVEMCP_ 和 OVAL_ 前缀，与 reward_fn 一致）
+    for key in ("LIVEMCP_LATA", "OVAL_LATA"):
+        val = os.environ.get(key, "")
+        if val:
+            return "none" if val.lower() in _DISABLED else val.lower()
     # config 次之
     if config:
-        return str(config.get("lata_mode", config.get("lata", "none")))
+        return str(config.get("lata_mode", config.get("lata", "none"))).lower()
     return "none"
 
 
@@ -92,22 +99,27 @@ def _diagnose_batch(index, non_tensor_batch, task_ids, levels, scenario_types, s
     nunique_scenario = len(set(scenario_types))
     nb_fields = set(non_tensor_batch.keys()) if non_tensor_batch else set()
     logger.info(
-        f"[schemashift_grpo] batch={n}, tasks={nunique_task}, "
+        f"[livemcp_grpo] batch={n}, tasks={nunique_task}, "
         f"levels={nunique_level}, scenarios={nunique_scenario}, "
         f"nb_fields={nb_fields}, "
         f"score_range=[{scores.min().item():.4f}, {scores.max().item():.4f}]"
     )
 
-    # 运行时 group 完整性检查：每个 group 应有 9 条（3:3:3）
+    # 运行时 group 完整性检查：从数据中推断期望的 group size（取众数）
     # 如果大量 group 不完整，说明 shuffle 或 batch_size 配置错误
     from collections import Counter
     group_sizes = Counter(task_ids)
-    incomplete = {g: c for g, c in group_sizes.items() if c != 9}
+    if len(group_sizes) > 1:
+        expected_group_size = group_sizes.most_common(1)[0][1]
+        incomplete = {g: c for g, c in group_sizes.items() if c != expected_group_size}
+    else:
+        expected_group_size = next(iter(group_sizes.values()))
+        incomplete = {}
     if incomplete:
         n_incomplete = len(incomplete)
         logger.warning(
-            f"[schemashift_grpo] {n_incomplete}/{nunique_task} groups 记录数 != 9。"
-            f"StratAdv 可能退化（请确认 data.shuffle=False 且 train_batch_size 为 9 的倍数）。"
+            f"[livemcp_grpo] {n_incomplete}/{nunique_task} groups 记录数 != {expected_group_size}。"
+            f"StratAdv 可能退化（请确认 data.shuffle=False 且 train_batch_size 为 {expected_group_size} 的倍数）。"
             f"不完整 group 示例 (前3): "
             + ", ".join(f"{g}:{c}" for g, c in list(incomplete.items())[:3])
         )
@@ -118,14 +130,14 @@ def _diagnose_batch(index, non_tensor_batch, task_ids, levels, scenario_types, s
             unique_levels = set(g_levels)
             if len(unique_levels) < 2:
                 logger.warning(
-                    f"[schemashift_grpo] group {gid} 所有样本 "
+                    f"[livemcp_grpo] group {gid} 所有样本 "
                     f"perturbation_level 相同 ({unique_levels})，"
                     f"分层 advantage 退化为 GRPO baseline"
                 )
 
 
-@register_adv_est("schemashift_grpo")
-def compute_schemashift_grpo_advantage(
+@register_adv_est("livemcp_grpo")
+def compute_livemcp_grpo_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
@@ -146,12 +158,12 @@ def compute_schemashift_grpo_advantage(
     - stratum = (perturbation_level, scenario_type)
     - fallback: stratum 内 < 3 样本时逐级回退（scenario → global）
     """
-    # P1-3: 支持 config.beta 和 config.schemashift.beta 两种路径
+    # P1-3: 支持 config.beta 和 config.livemcp.beta 两种路径
     if config:
         beta_val = config.get("beta", None)
         if beta_val is None:
             # fallback: nested path
-            ss_cfg = config.get("schemashift", {})
+            ss_cfg = config.get("livemcp", {})
             if isinstance(ss_cfg, dict):
                 beta_val = ss_cfg.get("beta", 0.25)
             else:
@@ -185,6 +197,9 @@ def compute_schemashift_grpo_advantage(
                 extras = list(extra_infos)
             else:
                 extras = [extra_infos]
+            # Normalize JSON-string extra_info elements (pyarrow serialization)
+            from src.utils import normalize_extra_info
+            extras = [normalize_extra_info(e) for e in extras]
             if extras and isinstance(extras[0], dict):
                 if nb_groups is None:
                     nb_groups = np.array([e.get("group_id", e.get("episode_id", f"unk_{i}")) for i, e in enumerate(extras)], dtype=object)
@@ -233,7 +248,7 @@ def compute_schemashift_grpo_advantage(
     # P1-8: 校验 metadata 数组长度等于 batch size
     if len(task_ids) != bsz or len(levels) != bsz or len(scenario_types) != bsz:
         raise ValueError(
-            f"[schemashift_grpo] metadata 长度不匹配 batch size: "
+            f"[livemcp_grpo] metadata 长度不匹配 batch size: "
             f"task_ids={len(task_ids)}, levels={len(levels)}, "
             f"scenario_types={len(scenario_types)}, bsz={bsz}, source={source}"
         )
@@ -259,12 +274,12 @@ def compute_schemashift_grpo_advantage(
                 advantages = scores - scores.mean()
             # else: bsz=1, advantage=0（无法比较）
 
-            if not hasattr(compute_schemashift_grpo_advantage, '_fallback_warned'):
+            if not hasattr(compute_livemcp_grpo_advantage, '_fallback_warned'):
                 logger.warning(
-                    f"[schemashift_grpo] 所有 group 均为 size=1 (n_groups={len(task2indices)})，"
+                    f"[livemcp_grpo] 所有 group 均为 size=1 (n_groups={len(task2indices)})，"
                     f"fallback 到 batch-level GRPO。如需 StratAdv，请确保数据包含 E4 分组结构。"
                 )
-                compute_schemashift_grpo_advantage._fallback_warned = True
+                compute_livemcp_grpo_advantage._fallback_warned = True
         else:
             # 正常 E4 分层逻辑
             for tid, indices in task2indices.items():
@@ -333,9 +348,9 @@ def compute_schemashift_grpo_advantage(
                 advantages[idx_tensor] = strat_advs + beta * global_z
 
         # 首次执行时打诊断日志
-        if not hasattr(compute_schemashift_grpo_advantage, '_diagnosed'):
+        if not hasattr(compute_livemcp_grpo_advantage, '_diagnosed'):
             _diagnose_batch(index, non_tensor_batch, task_ids, levels, scenario_types, scores)
-            compute_schemashift_grpo_advantage._diagnosed = True
+            compute_livemcp_grpo_advantage._diagnosed = True
 
         # ── 饱和组检测与跳过（§9.2-9.3） ──
         # std(J) < min_group_std → advantage = 0，不产生 policy gradient
@@ -358,13 +373,13 @@ def compute_schemashift_grpo_advantage(
                     n_saturated_groups += 1
                     saturated_group_ids.append(tid)
 
-        if n_saturated_groups > 0 and not hasattr(compute_schemashift_grpo_advantage, '_sat_warned'):
+        if n_saturated_groups > 0 and not hasattr(compute_livemcp_grpo_advantage, '_sat_warned'):
             logger.warning(
-                f"[schemashift_grpo] SATURATION: {n_saturated_groups}/{n_total_groups} groups skipped "
+                f"[livemcp_grpo] SATURATION: {n_saturated_groups}/{n_total_groups} groups skipped "
                 f"(std(J) < {min_group_std:.0e}). "
                 f"saturated_ids (前5): {saturated_group_ids[:5]}"
             )
-            compute_schemashift_grpo_advantage._sat_warned = True
+            compute_livemcp_grpo_advantage._sat_warned = True
 
         # ── LATA: Length-Aware Token Allocation ──
         # 当全部组饱和（advantage 已全零）时跳过 LATA 分配，避免无效计算

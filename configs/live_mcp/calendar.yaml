@@ -31,9 +31,6 @@ tools:
     - update_event
     - delete_event
 
-sampler:
-  class_path: src.live_mcp.sampler.CalendarSampler  # 任务采样器
-
 reward_profile: calendar_basic  # reward 配置 profile
 
 dependency_graph:

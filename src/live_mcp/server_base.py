@@ -46,8 +46,14 @@ class StatefulToolServer:
             }
         }
 
+    MAX_SESSIONS = 500  # evict oldest on overflow to prevent unbounded memory growth
+
     def _state(self, session_id: str) -> dict[str, Any]:
         if session_id not in self.sessions:
+            if len(self.sessions) >= self.MAX_SESSIONS:
+                # Evict oldest session (first inserted key)
+                oldest = next(iter(self.sessions))
+                del self.sessions[oldest]
             self.sessions[session_id] = self.seeder.reset_state(self.server_name, session_id, 42)
         return self.sessions[session_id]
 

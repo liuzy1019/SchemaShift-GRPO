@@ -10,9 +10,9 @@ MCP-RL Full 2 维 stratum advantage 测试。
 import torch
 import pytest
 
-from src.training.schemashift_advantage import (
+from src.training.livemcp_advantage import (
     compute_stratified_advantage,
-    compute_schemashift_advantages,
+    compute_livemcp_advantages,
 )
 
 
@@ -115,7 +115,7 @@ class TestStratifiedAdvantage:
         scenarios = ["single_step"] * 6
 
         adv_2d = compute_stratified_advantage(rewards, levels, scenarios, beta=0.25)
-        adv_1d = compute_schemashift_advantages(rewards, levels, beta=0.25)
+        adv_1d = compute_livemcp_advantages(rewards, levels, beta=0.25)
 
         # 当 scenario 全相同时，2 维退化为 1 维，结果应一致
         assert torch.allclose(adv_2d, adv_1d, atol=1e-5)

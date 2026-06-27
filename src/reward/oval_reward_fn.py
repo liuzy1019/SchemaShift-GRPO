@@ -3,7 +3,7 @@
 Entry point: compute_score(data_source, solution_str, ground_truth, extra_info=None)
 
 Pipeline:
-  1. Parse audit_events from extra_info (produced by SchemaShiftOvalLoop)
+  1. Parse audit_events from extra_info (produced by LiveMCPOvalLoop)
   2. Build EventLog, get DomainAdapter
   3. TaskReward → R_task
   4. SafetyVerifier → C_safety

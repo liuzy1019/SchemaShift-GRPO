@@ -85,7 +85,10 @@ class EmailServer(StatefulToolServer):
     def reply_email(self, session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
         state = self._state(session_id); orig = state["emails"].get(arguments["email_id"])
         if not orig: raise KeyError(f"email not found: {arguments['email_id']}")
-        eid = self._nxt_eml(state); tid = orig.get("thread_id", f"thd_{state['next_thread_num']:03d}")
+        eid = self._nxt_eml(state); tid = orig.get("thread_id")
+        if not tid:
+            tid = f"thd_{state['next_thread_num']:03d}"
+            state["next_thread_num"] += 1
         email = {"email_id": eid, "to": orig["sender"], "cc": "", "sender": "current_user@example.com", "subject": f"Re: {orig['subject']}", "body": arguments["body"], "labels": [], "thread_id": tid, "status": "sent", "date": "2026-06-24", "read": True}
         state["emails"][eid] = email; state["inbox_order"].append(eid)
         state["threads"].setdefault(tid, []).append(eid)

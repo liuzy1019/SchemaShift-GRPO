@@ -123,8 +123,8 @@ def test_verl_fsdp_config_symbols():
 
 
 def test_verl_advantage_registry_symbols():
-    """训练入口用 register_adv_est 注入 schemashift_grpo，符号丢失会导致整个
-    SchemaShift 路径失效。"""
+    """训练入口用 register_adv_est 注入 livemcp_grpo，符号丢失会导致整个
+    LiveMCP 路径失效。"""
     _require_symbols(
         "verl.trainer.ppo.core_algos",
         ["register_adv_est", "AdvantageEstimator"],
@@ -139,7 +139,7 @@ def test_verl_advantage_registry_symbols():
 
 def test_project_entry_imports():
     """核心模块必须能 import，且不会触发副作用错误。"""
-    importlib.import_module("src.training.schemashift_grpo_estimator")
+    importlib.import_module("src.training.livemcp_grpo_estimator")
     importlib.import_module("src.training.register_estimator")
     importlib.import_module("src.reward.oval_reward_fn")
     importlib.import_module("src.reward.action_parser")
@@ -148,18 +148,18 @@ def test_project_entry_imports():
 def test_register_estimator_callable():
     """register 入口能调通；返回 True 才算注册成功。
 
-    注意：register_schemashift_estimator 当前不是幂等的（重复调会叠加 patch 链），
+    注意：register_livemcp_estimator 当前不是幂等的（重复调会叠加 patch 链），
     所以这里只调一次。幂等化属于 P0-2 / P1 范畴，未来加上后再扩展为 idempotent 测试。"""
     pytest.importorskip("verl", reason="verl 未安装")
-    from src.training.register_estimator import register_schemashift_estimator
-    assert register_schemashift_estimator() is True
+    from src.training.register_estimator import register_livemcp_estimator
+    assert register_livemcp_estimator() is True
 
 
 def test_register_estimator_disabled_path():
-    """显式 use_schemashift=False 时必须返回 False，不抛异常。"""
+    """显式 use_livemcp=False 时必须返回 False，不抛异常。"""
     pytest.importorskip("verl", reason="verl 未安装")
-    from src.training.register_estimator import register_schemashift_estimator
-    assert register_schemashift_estimator({"use_schemashift": False}) is False
+    from src.training.register_estimator import register_livemcp_estimator
+    assert register_livemcp_estimator({"use_livemcp": False}) is False
 
 
 ########## arl 环境一致性提醒（软检查）

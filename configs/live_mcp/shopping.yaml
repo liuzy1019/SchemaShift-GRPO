@@ -32,9 +32,6 @@ tools:
     - remove_from_cart
     - checkout
 
-sampler:
-  class_path: src.live_mcp.sampler.ShoppingSampler
-
 reward_profile: shopping_basic
 
 dependency_graph:

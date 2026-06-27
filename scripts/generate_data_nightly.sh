@@ -14,8 +14,37 @@ mkdir -p "$LOG_DIR"
 VLLM_LOG="$LOG_DIR/vllm_32b_nightly.log"
 GEN_LOG="$LOG_DIR/generate_32b_nightly.log"
 
-# ---- Step 1: Start vLLM server on GPUs 4,5,6,7 ----
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting vLLM 32B on GPUs 4,5,6,7, port 8001..." | tee -a "$GEN_LOG"
+# ---- cleanup function: kill vLLM + orphaned children ----
+_cleanup_vllm() {
+    local exit_code=$?
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cleanup: stopping vLLM..." | tee -a "$GEN_LOG" 2>/dev/null || true
+
+    # Kill the main vLLM process tree
+    if [ -n "${VLLM_PID:-}" ] && kill -0 "$VLLM_PID" 2>/dev/null; then
+        kill -TERM "$VLLM_PID" 2>/dev/null || true
+        # Wait up to 10s for graceful shutdown
+        for _ in $(seq 1 10); do
+            kill -0 "$VLLM_PID" 2>/dev/null || break
+            sleep 1
+        done
+        # Force kill if still alive
+        kill -KILL "$VLLM_PID" 2>/dev/null || true
+        wait "$VLLM_PID" 2>/dev/null || true
+        echo "  vLLM PID $VLLM_PID stopped" | tee -a "$GEN_LOG" 2>/dev/null || true
+    fi
+
+    # Kill any orphaned VLLM::EngineCore processes left on the GPU
+    VLLM_ORPHANS=$(ps -eo pid,comm --no-headers 2>/dev/null | awk '/VLLM::EngineCore/{print $1}' || true)
+    if [ -n "$VLLM_ORPHANS" ]; then
+        echo "  Killing orphaned VLLM::EngineCore: $VLLM_ORPHANS" | tee -a "$GEN_LOG" 2>/dev/null || true
+        for pid in $VLLM_ORPHANS; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+    fi
+
+    exit $exit_code
+}
+trap _cleanup_vllm EXIT INT TERM
 
 # Bypass flashinfer JIT compilation (CUDA 11.8 + GCC 12.3 incompatible with flashinfer 0.6.4 JIT)
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
@@ -70,11 +99,6 @@ python scripts/generate_data.py \
     2>&1 | tee -a "$GEN_LOG"
 
 GEN_EXIT_CODE=${PIPESTATUS[0]}
-
-# ---- Step 4: Cleanup ----
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Shutting down vLLM..." | tee -a "$GEN_LOG"
-kill "$VLLM_PID" 2>/dev/null || true
-wait "$VLLM_PID" 2>/dev/null || true
 
 if [ $GEN_EXIT_CODE -eq 0 ]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Done! Data saved to data/train.parquet and data/val.parquet" | tee -a "$GEN_LOG"

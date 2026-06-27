@@ -1,9 +1,9 @@
 """register_estimator.py monkey-patch 集成测试。
 
 构造最小 fake DataProto，验证：
-1. patched_compute_advantage 把 non_tensor_batch 透传给 schemashift_grpo estimator;
+1. patched_compute_advantage 把 non_tensor_batch 透传给 livemcp_grpo estimator;
 2. 端到端 advantages 计算成功且为 finite tensor;
-3. 非 schemashift 路径不会调用我们的 estimator。
+3. 非 livemcp 路径不会调用我们的 estimator。
 """
 import importlib
 import sys
@@ -30,8 +30,8 @@ class _FakeDataProto:
 def patched_module():
     mod = importlib.import_module("verl.trainer.ppo.ray_trainer")
     original = mod.compute_advantage
-    from src.training.register_estimator import register_schemashift_estimator
-    ok = register_schemashift_estimator({"use_schemashift": True})
+    from src.training.register_estimator import register_livemcp_estimator
+    ok = register_livemcp_estimator({"use_livemcp": True})
     assert ok
     assert mod.compute_advantage is not original
     yield mod
@@ -61,9 +61,9 @@ def _make_data(bsz=9):
     )
 
 
-def test_patch_routes_schemashift_to_estimator(patched_module):
+def test_patch_routes_livemcp_to_estimator(patched_module):
     data = _make_data()
-    out = patched_module.compute_advantage(data, "schemashift_grpo")
+    out = patched_module.compute_advantage(data, "livemcp_grpo")
     assert "advantages" in out.batch
     advantages = out.batch["advantages"]
     assert advantages.shape == (9, 1)
@@ -87,7 +87,7 @@ def test_patch_passes_non_tensor_batch(patched_module, monkeypatch):
     )
 
     data = _make_data()
-    patched_module.compute_advantage(data, "schemashift_grpo")
+    patched_module.compute_advantage(data, "livemcp_grpo")
 
     assert captured["non_tensor_batch"] is not None
     assert "perturbation_level" in captured["non_tensor_batch"]
@@ -97,7 +97,7 @@ def test_patch_passes_non_tensor_batch(patched_module, monkeypatch):
 
 
 def test_patch_does_not_break_other_estimators(patched_module, monkeypatch):
-    """patch 后非 schemashift 路径必须走原 verl 实现，不会调用我们的 estimator。"""
+    """patch 后非 livemcp 路径必须走原 verl 实现，不会调用我们的 estimator。"""
     sentinel_calls = {"n": 0}
 
     def fake_estimator(**kwargs):
@@ -111,23 +111,23 @@ def test_patch_does_not_break_other_estimators(patched_module, monkeypatch):
     )
 
     data = _make_data()
-    # schemashift_grpo 应路由到自定义 estimator
-    patched_module.compute_advantage(data, "schemashift_grpo")
+    # livemcp_grpo 应路由到自定义 estimator
+    patched_module.compute_advantage(data, "livemcp_grpo")
     assert sentinel_calls["n"] == 1
 
-    # 非 schemashift_grpo 走原 verl 路径，fake 不应被再次调用
+    # 非 livemcp_grpo 走原 verl 路径，fake 不应被再次调用
     data2 = _make_data()
     try:
         patched_module.compute_advantage(data2, "grpo")
     except Exception:
         pass  # 原路径是否成功取决于 verl 内部依赖，这里只关心是否绕过了 fake
     assert sentinel_calls["n"] == 1, (
-        "非 schemashift_grpo 路径不应触发自定义 estimator"
+        "非 livemcp_grpo 路径不应触发自定义 estimator"
     )
 
 
 def test_estimator_consumes_perturbation_level(patched_module):
     data = _make_data()
-    out = patched_module.compute_advantage(data, "schemashift_grpo")
+    out = patched_module.compute_advantage(data, "livemcp_grpo")
     advantages = out.batch["advantages"].squeeze(-1)
     assert abs(advantages.sum().item()) < 1e-4

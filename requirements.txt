@@ -1,4 +1,4 @@
-# SchemaShift-GRPO dependencies for the verified L20 stack.
+# LiveMCP-GRPO dependencies for the verified L20 stack.
 #
 # L20 server:
 #   nvcc 12.9.86 / CUDA Toolkit 12.9

@@ -1,5 +1,5 @@
 """
-schemashift_grpo_estimator 逻辑测试。
+livemcp_grpo_estimator 逻辑测试。
 
 由于 verl/Ray 依赖不在本地环境，通过等价逻辑验证 estimator 的核心算法。
 生产 estimator 对每个 task group 独立调用分层 advantage，
@@ -8,7 +8,7 @@ schemashift_grpo_estimator 逻辑测试。
 import pytest
 import torch
 
-from src.training.schemashift_advantage import compute_schemashift_advantages
+from src.training.livemcp_advantage import compute_livemcp_advantages
 
 
 def _simulate_estimator(
@@ -18,9 +18,9 @@ def _simulate_estimator(
     beta: float = 0.25,
     norm_by_std: bool = True,
 ) -> torch.Tensor:
-    """模拟 schemashift_grpo_estimator 的 per-task-per-level 分层逻辑。
+    """模拟 livemcp_grpo_estimator 的 per-task-per-level 分层逻辑。
 
-    对每个 task 独立调用 compute_schemashift_advantages。
+    对每个 task 独立调用 compute_livemcp_advantages。
     """
     from collections import defaultdict
 
@@ -68,7 +68,7 @@ def _simulate_estimator(
 
 
 class TestPerTaskPerLevelStratification:
-    """验证 per-task-per-level 分层逻辑（与 schemashift_grpo_estimator 等价）。"""
+    """验证 per-task-per-level 分层逻辑（与 livemcp_grpo_estimator 等价）。"""
 
     def test_single_task_equivalent_to_global(self):
         """单 task 时，per-task 分层应与全局分层等价。"""
@@ -76,7 +76,7 @@ class TestPerTaskPerLevelStratification:
         levels = ["none"] * 3 + ["mild"] * 3 + ["strong"] * 3
         task_ids = ["task1"] * 9
 
-        adv_global = compute_schemashift_advantages(scores, levels, beta=0.25)
+        adv_global = compute_livemcp_advantages(scores, levels, beta=0.25)
         adv_per_task = _simulate_estimator(scores, task_ids, levels, beta=0.25)
 
         assert torch.allclose(adv_global, adv_per_task), (
@@ -104,7 +104,7 @@ class TestPerTaskPerLevelStratification:
         task_ids = ["task1"] * 3 + ["task2"] * 3
 
         adv_per_task = _simulate_estimator(scores, task_ids, levels, beta=0.25)
-        adv_global = compute_schemashift_advantages(scores, levels, beta=0.25)
+        adv_global = compute_livemcp_advantages(scores, levels, beta=0.25)
 
         # per-task: task1 的 advantage 应接近 0（reward 相同，std=0）
         assert abs(adv_per_task[0].item()) < 1e-5, (
@@ -221,7 +221,7 @@ class TestUidFallback:
 
     @staticmethod
     def _parse_uid(uid: str) -> tuple[str, str]:
-        """复制 schemashift_grpo_estimator._parse_uid 的逻辑。"""
+        """复制 livemcp_grpo_estimator._parse_uid 的逻辑。"""
         if "___" in uid:
             parts = uid.split("___", 1)
             return parts[0], parts[1]

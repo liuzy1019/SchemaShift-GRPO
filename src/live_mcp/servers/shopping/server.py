@@ -97,7 +97,10 @@ class ShoppingServer(StatefulToolServer):
         state = self._state(session_id); pid = arguments["product_id"]
         kept = []; removed = None
         for item in state["cart"]:
-            if item["product_id"] == pid: removed = item; state["products"][pid]["stock"] += item["quantity"]
+            if item["product_id"] == pid:
+                removed = item
+                if pid in state["products"]:
+                    state["products"][pid]["stock"] += item["quantity"]
             else: kept.append(item)
         if removed is None:
             raise KeyError(f"product not in cart: {pid}")
@@ -113,7 +116,9 @@ class ShoppingServer(StatefulToolServer):
 
     def clear_cart(self, session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
         state = self._state(session_id)
-        for item in state["cart"]: state["products"][item["product_id"]]["stock"] += item["quantity"]
+        for item in state["cart"]:
+            if item["product_id"] in state["products"]:
+                state["products"][item["product_id"]]["stock"] += item["quantity"]
         state["cart"] = []; state.pop("applied_coupon", None)
         return _result(True, {"cart": [], "message": "cart cleared"}, None, "", True)
 

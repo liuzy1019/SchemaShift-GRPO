@@ -27,7 +27,7 @@
 
 | YAML 路径 | 当前值 | 说明 |
 |-----------|--------|------|
-| `algorithm.schemashift.beta` | 0.25 | StratAdv 分层权重 |
+| `algorithm.livemcp.beta` | 0.25 | StratAdv 分层权重 |
 | `data.max_prompt_length` | 10240 | 最大 prompt 长度 |
 | `data.max_response_length` | 4096 | 最大 response 长度 |
 | `rollout.group_size` | 1 | 数据侧 9 条/task |

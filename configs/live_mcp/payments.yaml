@@ -33,9 +33,6 @@ tools:
     - refund_invoice
     - create_webhook
 
-sampler:
-  class_path: src.live_mcp.sampler.PaymentsSampler
-
 reward_profile: payments_basic
 
 dependency_graph:

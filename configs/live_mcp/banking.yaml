@@ -33,9 +33,6 @@ tools:
     - transfer
     - freeze_account
 
-sampler:
-  class_path: src.live_mcp.sampler.BankingSampler
-
 reward_profile: banking_basic
 
 dependency_graph:

@@ -33,9 +33,6 @@ tools:
     - create_thread
     - react_message
 
-sampler:
-  class_path: src.live_mcp.sampler.TeamChatSampler
-
 reward_profile: team_chat_basic
 
 dependency_graph:

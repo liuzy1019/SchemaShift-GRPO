@@ -20,6 +20,9 @@ logs/
 data/*.parquet
 data/*.json
 data/*.jsonl
+data/*.log
+data/*.txt
+data/runs/
 data/possible_answer/
 data/toolace/raw/
 data/toolace/processed/

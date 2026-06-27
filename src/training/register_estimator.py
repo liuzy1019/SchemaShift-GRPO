@@ -1,15 +1,15 @@
 """
-verl 集成入口：注册 schemashift_grpo estimator + patch verl 传递 non_tensor_batch
+verl 集成入口：注册 livemcp_grpo estimator + patch verl 传递 non_tensor_batch
 + lambda_safe 跨 batch 更新（file-backed LambdaState）。
 
 reference verl (ray_trainer.py:242-258) 的自定义 estimator 路径只传
 token_level_rewards/response_mask/index(uid)/config，不传 non_tensor_batch。
-这里 monkey-patch compute_advantage 使 schemashift_grpo 也收到 non_tensor_batch。
+这里 monkey-patch compute_advantage 使 livemcp_grpo 也收到 non_tensor_batch。
 
 lambda_safe 更新流：
   1. oval_reward_fn.compute_score 输出 score(=J), c_safety, r_task 等
   2. verl 将 score 存入 token_level_rewards，c_safety 可能保留在 non_tensor_batch
-  3. schemashift_grpo estimator 在 batch 边界调用 LambdaState.update()
+  3. livemcp_grpo estimator 在 batch 边界调用 LambdaState.update()
   4. 更新后的 lambda_safe 被 oval_reward_fn 读取（通过 LambdaState.load_or_default）
 """
 
@@ -96,13 +96,13 @@ def _update_lambda_safe_safe(non_tensor_batch, batch_size: int) -> bool:
         return False
 
 
-def _normalize_schemashift_non_tensor_batch(non_tensor_batch, batch_size: int):
-    """Promote SchemaShift fields from extra_info to top-level non_tensor_batch.
+def _normalize_livemcp_non_tensor_batch(non_tensor_batch, batch_size: int):
+    """Promote LiveMCP fields from extra_info to top-level non_tensor_batch.
 
     verl may preserve the whole extra_info dict while dropping some top-level
     parquet columns during generation/reward plumbing. The estimator supports an
     extra_info fallback, but promoting fields here keeps diagnostics honest and
-    avoids silently degrading the SchemaShift path.
+    avoids silently degrading the LiveMCP path.
     """
     if not non_tensor_batch:
         return non_tensor_batch
@@ -162,21 +162,21 @@ def _normalize_schemashift_non_tensor_batch(non_tensor_batch, batch_size: int):
     return normalized
 
 
-def register_schemashift_estimator(config: Optional[dict] = None) -> bool:
-    """注册 schemashift_grpo estimator + patch verl 传递 non_tensor_batch。"""
+def register_livemcp_estimator(config: Optional[dict] = None) -> bool:
+    """注册 livemcp_grpo estimator + patch verl 传递 non_tensor_batch。"""
     cfg = config or {}
-    if not cfg.get("use_schemashift", True):
-        logger.info("SchemaShift 已禁用")
+    if not cfg.get("use_livemcp", True):
+        logger.info("LiveMCP 已禁用")
         return False
 
     try:
-        from src.training import schemashift_grpo_estimator  # noqa: F401
-        logger.info("schemashift_grpo estimator 已注册")
+        from src.training import livemcp_grpo_estimator  # noqa: F401
+        logger.info("livemcp_grpo estimator 已注册")
     except Exception as e:
         logger.error(f"estimator 注册失败: {e}")
         return False
 
-    # Patch verl 的 compute_advantage 使 schemashift_grpo 收到 non_tensor_batch
+    # Patch verl 的 compute_advantage 使 livemcp_grpo 收到 non_tensor_batch
     try:
         mod = importlib.import_module("verl.trainer.ppo.ray_trainer")
         core_algos = importlib.import_module("verl.trainer.ppo.core_algos")
@@ -187,11 +187,11 @@ def register_schemashift_estimator(config: Optional[dict] = None) -> bool:
         def patched_compute_advantage(data, adv_estimator, *args, **kwargs):
             from verl.trainer.ppo.core_algos import get_adv_estimator_fn
 
-            # 处理 schemashift_grpo（走自定义 estimator 路径，注入 non_tensor_batch）
-            if str(adv_estimator) == "schemashift_grpo":
+            # 处理 livemcp_grpo（走自定义 estimator 路径，注入 non_tensor_batch）
+            if str(adv_estimator) == "livemcp_grpo":
                 adv_estimator_fn = get_adv_estimator_fn(adv_estimator)
                 bsz = data.batch["token_level_rewards"].shape[0]
-                non_tensor_batch = _normalize_schemashift_non_tensor_batch(
+                non_tensor_batch = _normalize_livemcp_non_tensor_batch(
                     data.non_tensor_batch, bsz
                 )
                 adv_kwargs = {
@@ -220,7 +220,7 @@ def register_schemashift_estimator(config: Optional[dict] = None) -> bool:
                 has_fields = {"perturbation_level", "group_id", "scenario_type"}.issubset(nb_keys)
                 if not hasattr(patched_compute_advantage, '_diagnosed'):
                     logger.info(
-                        f"schemashift_grpo monkey-patch: "
+                        f"livemcp_grpo monkey-patch: "
                         f"batch_size={bsz}, "
                         f"non_tensor_batch_keys={nb_keys}, "
                         f"has_perturbation_level={has_fields}"
@@ -235,10 +235,14 @@ def register_schemashift_estimator(config: Optional[dict] = None) -> bool:
                 return original_fn(data, adv_estimator, *args, **kwargs)
 
         mod.compute_advantage = patched_compute_advantage
-        logger.info("verl compute_advantage 已 patch（schemashift_grpo 可接收 non_tensor_batch）")
+        logger.info("verl compute_advantage 已 patch（livemcp_grpo 可接收 non_tensor_batch）")
+        # Smoke check: verify the patched function is callable
+        if not callable(mod.compute_advantage):
+            raise RuntimeError("verl compute_advantage patch verification failed: not callable")
+        logger.debug("verl compute_advantage smoke check passed")
     except (ImportError, AttributeError) as e:
         raise RuntimeError(
-            f"verl compute_advantage patch 失败，SchemaShift estimator 无法工作: {e}"
+            f"verl compute_advantage patch 失败，LiveMCP estimator 无法工作: {e}"
         ) from e
 
     return True

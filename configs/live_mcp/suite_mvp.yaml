@@ -31,11 +31,11 @@ rollout:
 reward:
   profile: full_default
   weights:
-    validity: 0.25  # 格式合法性
-    coverage: 0.25  # 工具覆盖率
-    efficiency: 0.10  # 调用效率
-    tool_selection: 0.20  # 工具选择正确性
-    argument_value: 0.20  # 参数值正确性
+    validity: 0.50       # R_validity  (was 0.25)
+    coverage: 0.50       # R_coverage  (was 0.25)
+    efficiency: 0.15     # R_efficiency  (was 0.10)
+    tool_selection: 0.20 # R_name  (was 0.20)
+    argument_value: 0.10 # R_arg  (was 0.20)
 
 trace:
   output_dir: data/live_mcp/traces

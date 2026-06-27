@@ -58,7 +58,6 @@ class TaskOrchestrator:
         seed: int,
         difficulty: str,
         max_turns: int = 8,
-        max_retries: int = 3,
     ) -> LiveTask:
         """PROVE-style state-machine generation with LLM-in-the-loop.
 
@@ -186,6 +185,14 @@ class TaskOrchestrator:
         finally:
             self.manager.close_session(session_id)
 
+        # ── Validate: PROVE-style tasks require at least one tool call ──
+        if not oracle_calls:
+            raise RuntimeError(
+                f"No tool calls recorded for {server_name} task {task_id} "
+                f"(LLM answered without using tools — task is not a valid "
+                f"tool-use training example)"
+            )
+
         oracle_program = OracleProgram(
             task_id=task_id,
             calls=oracle_calls,
@@ -207,7 +214,12 @@ class TaskOrchestrator:
                       missing_function_rate: float = 0.20,
                       ) -> list[LiveTask]:
         tasks: list[LiveTask] = []
-        servers = self.manager.server_names if server_name == "all" else [server_name]
+        if server_name == "all":
+            servers = self.manager.server_names
+        elif "," in server_name:
+            servers = [s.strip() for s in server_name.split(",") if s.strip()]
+        else:
+            servers = [server_name]
         if not servers:
             raise ValueError("no enabled Live MCP servers available")
         unknown = [s for s in servers if s not in self.manager.server_names]
@@ -252,10 +264,12 @@ class TaskOrchestrator:
                     self._apply_missing_function(task)
                 tasks.append(task)
                 if len(tasks) % 10 == 0:
-                    logger.info(
-                        f"generate_many progress: {len(tasks)}/{n_normal} tasks, "
+                    progress_msg = (
+                        f"[generate_many] {len(tasks)}/{n_normal} tasks, "
                         f"{failed} failures"
                     )
+                    print(progress_msg, flush=True)
+                    logger.info(progress_msg)
             except Exception as e:
                 failed += 1
                 domain_failures[current_server] = domain_failures.get(current_server, 0) + 1
@@ -265,6 +279,8 @@ class TaskOrchestrator:
                 )
                 if domain_failures[current_server] >= 3:
                     cooldown = base_cooldown * (2 ** (domain_failures[current_server] // 3 - 1))
+                    max_cooldown = max(200, len(servers) * 10)
+                    cooldown = min(cooldown, max_cooldown)
                     domain_cooldown_until[current_server] = idx + cooldown
                     logger.warning(
                         f"cooling down {current_server} for {cooldown} rounds "
@@ -307,7 +323,10 @@ class TaskOrchestrator:
     def _apply_distractors(self, task: LiveTask) -> None:
         known = {t["name"] for t in task.visible_tools}
         candidates = [t for t in self.manager.registry.all_tools() if t["name"] not in known]
-        rng = random.Random(hash(task.task_id))
+        # Use deterministic seed via hashlib (Python hash() is randomized by PYTHONHASHSEED)
+        import hashlib
+        seed_bytes = hashlib.md5(task.task_id.encode()).digest()
+        rng = random.Random(int.from_bytes(seed_bytes[:8], "big"))
         selected = rng.sample(candidates, min(len(candidates), rng.randint(3, 8)))
         task.visible_tools.extend(selected)
         task.metadata["has_distractors"] = True
@@ -384,8 +403,8 @@ class TaskOrchestrator:
 
     def _generate_irrelevant_query(self, server_name: str, seed: int) -> str | None:
         """Ask LLM teacher to generate a query unrelated to the server's tools."""
-        from src.live_mcp.task_planner import TaskPlanner
-        domain_desc = TaskPlanner.DOMAIN_DESCRIPTIONS.get(server_name, "")
+        from src.live_mcp.task_planner import DOMAIN_DESCRIPTIONS
+        domain_desc = DOMAIN_DESCRIPTIONS.get(server_name, "")
 
         prompt = (
             f"You are generating training data for an AI agent.\n\n"
@@ -455,7 +474,8 @@ class TaskOrchestrator:
                 t for t in all_tools
                 if self.manager.registry.server_for_tool(t["name"]) == server_name
             ]
-        except Exception:
+        except Exception as e:
+            logger.debug(f"_probe_dependency_graph: tool discovery failed for {server_name}: {e}")
             self.manager.close_session(session.session_id)
             return {}
 
@@ -480,8 +500,8 @@ class TaskOrchestrator:
                         fields: set[str] = set()
                         _collect_fields(result.observation, fields)
                         query_outputs[name] = fields
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"_probe_dependency_graph: probe failed for {name}: {e}")
 
             # Classify edges
             for a_tool, a_fields in query_outputs.items():

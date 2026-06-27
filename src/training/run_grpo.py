@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(PROJECT_DIR, "verl"))
 
 
 def _maybe_run_pre_check() -> None:
-    """E4 启动前：先跑通用长度预检（默认开启），再跑 SchemaShift 专属的
+    """E4 启动前：先跑通用长度预检（默认开启），再跑 LiveMCP 专属的
     3:3:3 group 完整性（OVAL_PRECHECK=1 才跑，离线校验代价高）。"""
     from src.training.length_check import (
         assert_e4_group_integrity,
@@ -54,13 +54,13 @@ def main() -> None:
     _maybe_run_pre_check()
 
     # 注册 agent loop（必须在 verl 启动前 import）
-    from src.agent_loop.schemashift_oval_loop import SchemaShiftOvalLoop  # noqa: F401
-    logger.info("Agent loop SchemaShiftOvalLoop 已注册")
+    from src.agent_loop.livemcp_oval_loop import LiveMCPOvalLoop  # noqa: F401
+    logger.info("Agent loop LiveMCPOvalLoop 已注册")
 
-    # 注册 schemashift_grpo estimator + patch verl 传递 non_tensor_batch
-    # 主进程注册一次，便于 fail-fast；ray actor 内还需重新注册（见下面 SchemaShiftTaskRunner）
-    from src.training.register_estimator import register_schemashift_estimator
-    register_schemashift_estimator()
+    # 注册 livemcp_grpo estimator + patch verl 传递 non_tensor_batch
+    # 主进程注册一次，便于 fail-fast；ray actor 内还需重新注册（见下面 LiveMCPTaskRunner）
+    from src.training.register_estimator import register_livemcp_estimator
+    register_livemcp_estimator()
 
     # ── 初始化 LambdaState（lambda_safe file-backed 共享状态） ──
     from src.oval_mcp.training.lambda_state import LambdaState, DEFAULT_STATE_PATH
@@ -76,14 +76,9 @@ def main() -> None:
     # 通过 task_runner_class hook 在 actor 进程里再注册一次。
     import hydra
     import ray
-    from verl.trainer.main_ppo import TaskRunner, run_ppo
+    from verl.trainer.main_ppo import run_ppo
 
-    class SchemaShiftTaskRunner(TaskRunner):
-        def run(self, config):
-            from src.agent_loop.schemashift_oval_loop import SchemaShiftOvalLoop  # noqa: F401
-            from src.training.register_estimator import register_schemashift_estimator
-            register_schemashift_estimator()
-            return super().run(config)
+    from src.training.livemcp_task_runner import LiveMCPTaskRunner
 
     @hydra.main(config_path="../../verl/verl/trainer/config", config_name="ppo_trainer", version_base=None)
     def _entry(config):
@@ -105,7 +100,7 @@ def main() -> None:
                     ray_tmp_dir, merge=True, force_add=True,
                 )
 
-        task_runner_class = ray.remote(num_cpus=1)(SchemaShiftTaskRunner)
+        task_runner_class = ray.remote(num_cpus=1)(LiveMCPTaskRunner)
         try:
             run_ppo(config, task_runner_class=task_runner_class)
         finally:

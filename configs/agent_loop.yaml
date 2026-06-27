@@ -2,5 +2,5 @@
 # 配合 actor_rollout_ref.rollout.agent.default_agent_loop 选择默认 loop
 
 # OVAL Live MCP rollout + 审计
-- name: schemashift_oval
-  _target_: src.agent_loop.schemashift_oval_loop.SchemaShiftOvalLoop
+- name: livemcp_oval
+  _target_: src.agent_loop.livemcp_oval_loop.LiveMCPOvalLoop

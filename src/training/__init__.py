@@ -1,7 +1,7 @@
-from .schemashift_grpo_estimator import compute_schemashift_grpo_advantage
-from .register_estimator import register_schemashift_estimator
+from .livemcp_grpo_estimator import compute_livemcp_grpo_advantage
+from .register_estimator import register_livemcp_estimator
 
 __all__ = [
-    "compute_schemashift_grpo_advantage",
-    "register_schemashift_estimator",
+    "compute_livemcp_grpo_advantage",
+    "register_livemcp_estimator",
 ]

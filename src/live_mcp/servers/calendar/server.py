@@ -70,7 +70,8 @@ class CalendarServer(StatefulToolServer):
         return _result(True, {"event": evt}, None, "", True)
 
     def delete_event(self, session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        state = self._state(session_id); eid = arguments["event_id"]; evt = state["events"].pop(eid)
+        state = self._state(session_id); eid = arguments["event_id"]; evt = self._evt(state, eid)
+        del state["events"][eid]
         return _result(True, {"deleted_event": evt}, None, "", True)
 
     def create_recurring(self, session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:

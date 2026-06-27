@@ -33,7 +33,7 @@ PROVE-style state-machine teacher + live MCP execution + event-sourced reward + 
 │   │   └── servers/ × 10           #   MCP 子进程服务器
 │   │
 │   ├── agent_loop/                  # verl Agent Loop
-│   │   ├── schemashift_oval_loop.py #   注册名 "schemashift_oval"
+│   │   ├── livemcp_oval_loop.py #   注册名 "livemcp_oval"
 │   │   └── oval_mcp_worker.py       #   session + audit wrapper
 │   │
 │   ├── oval_mcp/                    # 奖励 + 约束 GRPO 算法
@@ -48,7 +48,7 @@ PROVE-style state-machine teacher + live MCP execution + event-sourced reward + 
 │   │
 │   └── training/                    # verl 训练组件
 │       ├── run_grpo.py              #   正式训练入口
-│       ├── schemashift_grpo_estimator.py  # 2D StratAdv + LATA
+│       ├── livemcp_grpo_estimator.py  # 2D StratAdv + LATA
 │       ├── register_estimator.py    #   estimator 注册 + λ 更新
 │       └── length_check.py          #   数据长度预检
 │

@@ -1,17 +1,38 @@
 #!/bin/bash
-# GRPO training entry point — auto-detects GPU model.
+# GRPO training entry point — flexible multi-GPU via gpu_config.sh.
 #
 # Usage:
-#   bash scripts/train_grpo.sh
-#   bash scripts/train_grpo.sh --total-steps 100
+#   bash scripts/train_grpo.sh                           # all detected GPUs
+#   bash scripts/train_grpo.sh --gpus 0,1,2,3            # specific GPUs
+#   bash scripts/train_grpo.sh --total-steps 100         # override steps
+#   CUDA_VISIBLE_DEVICES=4,5,6,7 bash scripts/train_grpo.sh  # env override
+#   GPU_COUNT=4 bash scripts/train_grpo.sh               # limit GPU count
 #
 # Env var overrides:
 #   OVAL_TRAIN_FILE, OVAL_VAL_FILE     -- data paths
 #   OVAL_TOTAL_STEPS                   -- training steps
 #   OVAL_ROLLOUT_N                     -- rollouts per group
 #   OVAL_RESPONSE_LENGTH               -- max response tokens
+#   OVAL_GPU_MEM_UTIL                  -- override GPU memory utilization
 
 set -euo pipefail
+
+# ---- vLLM orphan cleanup trap ----
+# verl/vLLM rollout can leave zombie EngineCore processes.
+# This trap runs on any exit (normal, error, or signal) to clean them up.
+_cleanup_vllm_orphans() {
+    local exit_code=$?
+    VLLM_ORPHANS=$(ps -eo pid,comm --no-headers 2>/dev/null | awk '/VLLM::EngineCore/{print $1}' || true)
+    if [ -n "$VLLM_ORPHANS" ]; then
+        echo "[cleanup] Killing orphaned VLLM::EngineCore: $VLLM_ORPHANS" >&2
+        for pid in $VLLM_ORPHANS; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+        sleep 1
+    fi
+    exit $exit_code
+}
+trap _cleanup_vllm_orphans EXIT INT TERM
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${PROJECT_ROOT}"
@@ -29,7 +50,7 @@ export LOGURU_LEVEL=INFO
 unset PYTORCH_CUDA_ALLOC_CONF 2>/dev/null || true
 export TMPDIR="${TMPDIR:-/tmp/ssgrpo_tmp}"
 export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ssgrpo_ray}"
-export SCHEMASHIFT_RAY_TMPDIR="${SCHEMASHIFT_RAY_TMPDIR:-${RAY_TMPDIR}}"
+export LIVEMCP_RAY_TMPDIR="${LIVEMCP_RAY_TMPDIR:-${RAY_TMPDIR}}"
 mkdir -p "${TMPDIR}" "${RAY_TMPDIR}" outputs
 
 # ---- cleanup stale Ray ----
@@ -39,86 +60,87 @@ if ray status &>/dev/null 2>&1; then
     sleep 2
 fi
 
-# ---- GPU detection ----
-N_GPUS=8
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# ---- GPU detection (flexible, via gpu_config.sh) ----
+# Accept --gpus <ids> argument, pass remaining args through
+GPU_ARG=""
+REMAINING_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --gpus) GPU_ARG="$2"; shift 2 ;;
+        --gpus=*) GPU_ARG="${1#*=}"; shift ;;
+        *) REMAINING_ARGS+=("$1"); shift ;;
+    esac
+done
+set -- "${REMAINING_ARGS[@]}"
 
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "unknown")
-echo "GPU: ${GPU_NAME}"
-
-if echo "${GPU_NAME}" | grep -qi "L20"; then
-    # -- 8xL20 44GB --
-    GPU_TIER="L20"
-    GPU_MEM_UTIL=0.60
-    FREE_CACHE_ENGINE=True
-    ENFORCE_EAGER=False
-    PARAM_OFFLOAD=False
-    ACTOR_PARAM_OFFLOAD=False
-    PROMPT_LENGTH=12384
-    RESPONSE_LENGTH=16384
-    MAX_NUM_SEQS=64
-    MICRO_BATCH=2
-    TRAIN_BATCH_SIZE=32
-    MINI_BATCH_SIZE=8
-    ROLLOUT_N=9
-    echo "  -> L20 44GB: RESPONSE=${RESPONSE_LENGTH}, ROLLOUT_N=${ROLLOUT_N}"
-elif echo "${GPU_NAME}" | grep -qi "A10"; then
-    # -- 8xA10 23GB --
-    GPU_TIER="A10"
-    GPU_MEM_UTIL=0.50
-    FREE_CACHE_ENGINE=False
-    ENFORCE_EAGER=True
-    PARAM_OFFLOAD=True
-    ACTOR_PARAM_OFFLOAD=True
-    PROMPT_LENGTH=10240
-    RESPONSE_LENGTH=4096
-    MAX_NUM_SEQS=8
-    MICRO_BATCH=1
-    TRAIN_BATCH_SIZE=8
-    MINI_BATCH_SIZE=8
-    ROLLOUT_N=8
-    echo "  -> A10 23GB: RESPONSE=${RESPONSE_LENGTH}, ROLLOUT_N=${ROLLOUT_N} (constrained)"
+if [ -n "${GPU_ARG}" ]; then
+    . scripts/gpu_config.sh "${GPU_ARG}"
 else
-    # -- conservative fallback --
-    GPU_TIER="unknown"
-    GPU_MEM_UTIL=0.40
-    FREE_CACHE_ENGINE=False
-    ENFORCE_EAGER=True
-    PARAM_OFFLOAD=True
-    ACTOR_PARAM_OFFLOAD=True
-    PROMPT_LENGTH=10240
-    RESPONSE_LENGTH=2048
-    MAX_NUM_SEQS=8
-    MICRO_BATCH=1
-    TRAIN_BATCH_SIZE=8
-    MINI_BATCH_SIZE=8
-    ROLLOUT_N=4
-    echo "  -> Unknown GPU, conservative config"
+    . scripts/gpu_config.sh
+fi
+
+# Allow env override of mem_util
+GPU_MEM_UTIL="${OVAL_GPU_MEM_UTIL:-${GPU_MEM_UTIL}}"
+
+# ---- per-tier defaults (overrideable via env) ----
+if [ "${GPU_TIER}" = "L20" ]; then
+    PROMPT_LENGTH="${OVAL_PROMPT_LENGTH:-12384}"
+    RESPONSE_LENGTH="${OVAL_RESPONSE_LENGTH:-16384}"
+    MAX_NUM_SEQS="${OVAL_MAX_NUM_SEQS:-64}"
+    MICRO_BATCH="${OVAL_MICRO_BATCH:-2}"
+    TRAIN_BATCH_SIZE="${OVAL_TRAIN_BATCH_SIZE:-32}"
+    MINI_BATCH_SIZE="${OVAL_MINI_BATCH_SIZE:-8}"
+    ROLLOUT_N="${OVAL_ROLLOUT_N:-9}"
+elif [ "${GPU_TIER}" = "A10" ]; then
+    PROMPT_LENGTH="${OVAL_PROMPT_LENGTH:-10240}"
+    RESPONSE_LENGTH="${OVAL_RESPONSE_LENGTH:-4096}"
+    MAX_NUM_SEQS="${OVAL_MAX_NUM_SEQS:-8}"
+    MICRO_BATCH="${OVAL_MICRO_BATCH:-1}"
+    TRAIN_BATCH_SIZE="${OVAL_TRAIN_BATCH_SIZE:-8}"
+    MINI_BATCH_SIZE="${OVAL_MINI_BATCH_SIZE:-8}"
+    ROLLOUT_N="${OVAL_ROLLOUT_N:-8}"
+elif [ "${GPU_TIER}" = "A100" ] || [ "${GPU_TIER}" = "Hopper" ]; then
+    PROMPT_LENGTH="${OVAL_PROMPT_LENGTH:-16384}"
+    RESPONSE_LENGTH="${OVAL_RESPONSE_LENGTH:-16384}"
+    MAX_NUM_SEQS="${OVAL_MAX_NUM_SEQS:-128}"
+    MICRO_BATCH="${OVAL_MICRO_BATCH:-4}"
+    TRAIN_BATCH_SIZE="${OVAL_TRAIN_BATCH_SIZE:-64}"
+    MINI_BATCH_SIZE="${OVAL_MINI_BATCH_SIZE:-16}"
+    ROLLOUT_N="${OVAL_ROLLOUT_N:-16}"
+else
+    PROMPT_LENGTH="${OVAL_PROMPT_LENGTH:-10240}"
+    RESPONSE_LENGTH="${OVAL_RESPONSE_LENGTH:-2048}"
+    MAX_NUM_SEQS="${OVAL_MAX_NUM_SEQS:-8}"
+    MICRO_BATCH="${OVAL_MICRO_BATCH:-1}"
+    TRAIN_BATCH_SIZE="${OVAL_TRAIN_BATCH_SIZE:-8}"
+    MINI_BATCH_SIZE="${OVAL_MINI_BATCH_SIZE:-8}"
+    ROLLOUT_N="${OVAL_ROLLOUT_N:-4}"
 fi
 
 # ---- algorithm parameters (hardware-independent) ----
-MODEL_PATH="models/Qwen3-4B"
+MODEL_PATH="${OVAL_MODEL_PATH:-models/Qwen3-4B}"
 REWARD_FN_PATH="src/reward/oval_reward_fn.py"
-AGENT_LOOP="schemashift_oval"
+AGENT_LOOP="livemcp_oval"
 
-# env var overrides
+# env var overrides (OVAL_* prefix)
 TRAIN_FILE="${OVAL_TRAIN_FILE:-data/train.parquet}"
 VAL_FILE="${OVAL_VAL_FILE:-data/val.parquet}"
 TOTAL_STEPS="${OVAL_TOTAL_STEPS:-100}"
-ROLLOUT_N="${OVAL_ROLLOUT_N:-${ROLLOUT_N}}"
-RESPONSE_LENGTH="${OVAL_RESPONSE_LENGTH:-${RESPONSE_LENGTH}}"
-TRAIN_BATCH_SIZE="${OVAL_TRAIN_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}"
 
-LR=1e-6
-LR_WARMUP_RATIO=0.1
-KL_COEF=0.01
-PPO_EPOCHS=1
-GRAD_CLIP=1.0
-TEMPERATURE=0.7
-TOP_P=0.95
-ROLLOUT_TP=1
-LOG_PROB_MICRO_BATCH=1
-VAL_BATCH_SIZE="${TRAIN_BATCH_SIZE}"
+LR="${OVAL_LR:-1e-6}"
+LR_WARMUP_RATIO="${OVAL_LR_WARMUP_RATIO:-0.1}"
+KL_COEF="${OVAL_KL_COEF:-0.01}"
+PPO_EPOCHS="${OVAL_PPO_EPOCHS:-1}"
+GRAD_CLIP="${OVAL_GRAD_CLIP:-1.0}"
+TEMPERATURE="${OVAL_TEMPERATURE:-0.7}"
+TOP_P="${OVAL_TOP_P:-0.95}"
+ROLLOUT_TP="${OVAL_ROLLOUT_TP:-1}"
+LOG_PROB_MICRO_BATCH="${OVAL_LOG_PROB_MICRO_BATCH:-1}"
+VAL_BATCH_SIZE="${OVAL_VAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}"
+
+# FSDP offload: defaults from gpu_config.sh, env overrides
+ACTOR_PARAM_OFFLOAD="${OVAL_ACTOR_PARAM_OFFLOAD:-${PARAM_OFFLOAD}}"
+REF_PARAM_OFFLOAD="${OVAL_REF_PARAM_OFFLOAD:-${PARAM_OFFLOAD}}"
 
 # Phase 1 default: R_task + C_safety only (no F_gamma / P_process)
 export OVAL_I_SHAPE=0
@@ -128,17 +150,19 @@ echo "============================================"
 echo "OVAL-MCP GRPO Training"
 echo "============================================"
 echo "MODEL:     ${MODEL_PATH}"
-echo "GPU:       ${GPU_TIER} (${GPU_NAME})"
+echo "GPU:       ${GPU_COUNT}x ${GPU_TIER} (${GPU_MODEL})"
+echo "GPU_IDS:   ${GPU_IDS}"
 echo "TRAIN:     ${TRAIN_FILE}"
 echo "VAL:       ${VAL_FILE}"
 echo "REWARD:    ${REWARD_FN_PATH}"
 echo "AGENT:     ${AGENT_LOOP}"
 echo "STEPS:     ${TOTAL_STEPS}"
 echo "ROLLOUT_N: ${ROLLOUT_N}"
-echo "BATCH:     ${TRAIN_BATCH_SIZE} (mini=${MINI_BATCH_SIZE})"
+echo "BATCH:     ${TRAIN_BATCH_SIZE} (mini=${MINI_BATCH_SIZE}, micro=${MICRO_BATCH})"
 echo "RESPONSE:  ${RESPONSE_LENGTH}"
 echo "PROMPT:    ${PROMPT_LENGTH}"
 echo "MEM_UTIL:  ${GPU_MEM_UTIL}"
+echo "FSDP:      actor_offload=${ACTOR_PARAM_OFFLOAD} ref_offload=${REF_PARAM_OFFLOAD}"
 echo "============================================"
 
 # ---- register estimator ----
@@ -203,10 +227,10 @@ exec "${CONDA_PYTHON}" "scripts/train_runner.py" \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.agent.default_agent_loop="${AGENT_LOOP}" \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=configs/agent_loop.yaml \
-    actor_rollout_ref.rollout.agent.num_workers="${N_GPUS}" \
+    actor_rollout_ref.rollout.agent.num_workers="${GPU_COUNT}" \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH}" \
-    actor_rollout_ref.ref.fsdp_config.param_offload="${PARAM_OFFLOAD}" \
-    algorithm.adv_estimator=schemashift_grpo \
+    actor_rollout_ref.ref.fsdp_config.param_offload="${REF_PARAM_OFFLOAD}" \
+    algorithm.adv_estimator=livemcp_grpo \
     algorithm.use_kl_in_reward=True \
     algorithm.kl_penalty=kl \
     algorithm.kl_ctrl.type=fixed \
@@ -219,7 +243,7 @@ exec "${CONDA_PYTHON}" "scripts/train_runner.py" \
     trainer.total_epochs=1 \
     trainer.total_training_steps="${TOTAL_STEPS}" \
     trainer.nnodes=1 \
-    trainer.n_gpus_per_node="${N_GPUS}" \
+    trainer.n_gpus_per_node="${GPU_COUNT}" \
     trainer.save_freq=50 \
     trainer.val_before_train=False \
     trainer.test_freq=-1 \

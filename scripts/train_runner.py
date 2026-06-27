@@ -1,7 +1,7 @@
-"""SchemaShift GRPO Smoke / 统一训练入口。
+"""LiveMCP GRPO Smoke / 统一训练入口。
 
 标准 vLLM rollout，支持通过 Hydra config 切换 agent loop 和 advantage estimator。
-SchemaShiftTaskRunner 会注册 schemashift_grpo estimator，但实际使用的 estimator
+LiveMCPTaskRunner 会注册 livemcp_grpo estimator，但实际使用的 estimator
 由 config 中的 algorithm.adv_estimator 决定。
 
 正式训练请使用 src/training/run_grpo.py（OVAL Live MCP rollout）。
@@ -51,12 +51,12 @@ import ray
 from omegaconf import OmegaConf, open_dict
 
 from src.training.length_check import maybe_run_length_check
-from src.training.schemashift_task_runner import SchemaShiftTaskRunner
+from src.training.livemcp_task_runner import LiveMCPTaskRunner
 from verl.trainer.main_ppo import run_ppo
 
 # 注册 agent loop
 try:
-    from src.agent_loop.schemashift_oval_loop import SchemaShiftOvalLoop  # noqa: F401
+    from src.agent_loop.livemcp_oval_loop import LiveMCPOvalLoop  # noqa: F401
 except ImportError:
     pass
 
@@ -65,7 +65,7 @@ def _ensure_short_ray_temp_dir(config) -> str:
     """Set a short Ray temp dir to avoid AF_UNIX socket path length failures."""
     ray_init = config.ray_kwargs.get("ray_init", {})
     configured = ray_init.get("_temp_dir")
-    ray_tmp_dir = configured or os.environ.get("SCHEMASHIFT_RAY_TMPDIR") or "/tmp/ssgrpo_ray"
+    ray_tmp_dir = configured or os.environ.get("LIVEMCP_RAY_TMPDIR") or "/tmp/ssgrpo_ray"
     os.makedirs(ray_tmp_dir, exist_ok=True)
 
     # Ray also consults tempfile in some paths; keep it short for subprocesses.
@@ -82,15 +82,15 @@ def _ensure_short_ray_temp_dir(config) -> str:
 
 @hydra.main(config_path="../verl/verl/trainer/config", config_name="ppo_trainer", version_base=None)
 def main(config):
-    """SchemaShift GRPO 训练入口。"""
+    """LiveMCP GRPO 训练入口。"""
     # 长度预检：拦截超长 prompt，避免 verl 静默过滤导致 batch 缩水
     maybe_run_length_check(sys.argv[1:])
 
     ray_tmp_dir = _ensure_short_ray_temp_dir(config)
-    print(f"SchemaShift Ray temp dir: {ray_tmp_dir}")
+    print(f"LiveMCP Ray temp dir: {ray_tmp_dir}")
 
-    # 使用 SchemaShiftTaskRunner
-    task_runner_class = ray.remote(num_cpus=1)(SchemaShiftTaskRunner)
+    # 使用 LiveMCPTaskRunner
+    task_runner_class = ray.remote(num_cpus=1)(LiveMCPTaskRunner)
     run_ppo(config, task_runner_class=task_runner_class)
 
 

@@ -112,6 +112,7 @@ class LiveMCPBranch:
         difficulty_mix: dict[str, float] | None = None,
         model_path: str = "models/Qwen3-4B",
         api_base: str | None = None,
+        device: int | None = None,
         irrelevance_ratio: float = 0.05,
         distractor_rate: float = 0.40,
         missing_function_rate: float = 0.20,
@@ -128,7 +129,7 @@ class LiveMCPBranch:
                 mode="openai", model_path=model_path, api_base=api_base,
             )
         else:
-            client = LLMClient(mode="local", model_path=model_path)
+            client = LLMClient(mode="local", model_path=model_path, device=device)
 
         orchestrator = TaskOrchestrator(
             self.suite_config, self.manager, self.executor, client,

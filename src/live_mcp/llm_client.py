@@ -1,8 +1,17 @@
 """LLM inference client for teacher-guided data generation.
 
-Supports two backends:
-- local: transformers pipeline (offline, no server needed)
+Supports three backends:
+- local:  transformers pipeline on a single device (default: cuda:0)
 - openai: OpenAI-compatible API (vLLM server or external)
+- local_pool: multi-process data-parallel across GPUs (for batch generation)
+
+Multi-GPU modes:
+1. Tensor Parallel (TP) — vLLM server with --tensor-parallel-size N
+   → use mode="openai", api_base="http://localhost:8000/v1"
+2. Data Parallel (DP) — N independent model copies on N GPUs
+   → use LLMClientPool(mode="local_dp", gpu_ids=[0,1,2,3])
+3. Device assignment — pin local mode to a specific GPU
+   → use LLMClient(mode="local", device=2)
 """
 
 from __future__ import annotations
@@ -10,9 +19,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import multiprocessing as mp
 from typing import Any
 
 from loguru import logger
+
+from src.utils import extract_json
 
 # Lazy imports to avoid hard dependency on model packages
 _HAS_TRANSFORMERS = False
@@ -34,11 +46,15 @@ class LLMClient:
     """Lightweight LLM inference wrapper.
 
     Usage:
-        client = LLMClient(mode="local", model_path="models/Qwen3-4B")
-        # or
+        # Single-GPU local
+        client = LLMClient(mode="local", model_path="models/Qwen3-4B", device=0)
+
+        # Multi-GPU with device_map="auto" (model parallelism for large models)
+        client = LLMClient(mode="local", model_path="models/Qwen3-32B")
+
+        # vLLM / OpenAI-compatible server
         client = LLMClient(mode="openai", model_path="Qwen3-4B",
                           api_base="http://localhost:8000/v1")
-        response = client.generate(prompt)
     """
 
     def __init__(
@@ -49,6 +65,7 @@ class LLMClient:
         api_key: str = "not-needed",
         temperature: float = 0.7,
         max_tokens: int = 1024,
+        device: int | str | None = None,
     ):
         self.mode = mode
         self.model_path = model_path
@@ -60,6 +77,18 @@ class LLMClient:
         self._tokenizer = None
         self._client = None
 
+        # Resolve device_map for local mode
+        if device is not None:
+            # Pin to specific GPU: e.g. device=2 → {"": "cuda:2"}
+            if isinstance(device, int):
+                self._device_map = {"": f"cuda:{device}"}
+            elif isinstance(device, str) and device == "auto":
+                self._device_map = "auto"
+            else:
+                self._device_map = {"": str(device)}
+        else:
+            self._device_map = "auto"
+
     def _ensure_pipe(self):
         if self.mode == "local" and self._pipe is None:
             if not _HAS_TRANSFORMERS:
@@ -67,12 +96,12 @@ class LLMClient:
                     "transformers not installed. Use mode='openai' "
                     "or pip install transformers torch"
                 )
-            logger.info(f"Loading local model: {self.model_path}")
+            logger.info(f"Loading local model: {self.model_path} (device_map={self._device_map})")
             self._pipe = pipeline(
                 "text-generation",
                 model=self.model_path,
                 trust_remote_code=True,
-                device_map="auto",
+                device_map=self._device_map,
                 torch_dtype="auto",
             )
             from transformers import AutoTokenizer
@@ -138,7 +167,7 @@ class LLMClient:
             [{"role": "user", "content": prompt}],
             temperature,
         )
-        return _extract_json(raw)
+        return extract_json(raw)
 
     def _generate_local(self, prompt: str, temperature: float, max_tokens: int) -> str:
         """Low-level local generation via transformers pipeline."""
@@ -150,58 +179,167 @@ class LLMClient:
             top_p=0.95,
             return_full_text=False,
         )
-        text = result[0]["generated_text"]
-        # Strip Qwen3 <think>...</think> blocks (defense-in-depth)
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-        if "<think>" in text:
-            after_think = re.sub(r"<think>[\s\S]+", "", text)
-            text = after_think.strip() if after_think.strip() else ""
-        text = text.strip()
+        from src.utils import strip_think_tags
+        text = strip_think_tags(result[0]["generated_text"])
         return text
 
-    def _generate_openai(self, prompt: str, temperature: float, max_tokens: int) -> str:
-        """Low-level OpenAI API generation (kept for backward compat)."""
-        response = self._client.chat.completions.create(
-            model=self.model_path,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            max_tokens=max_tokens,
+
+class LLMClientPool:
+    """Data-parallel inference pool across multiple GPUs.
+
+    Each GPU runs an independent model copy. Tasks are distributed
+    via multiprocessing.Queue. Use when you have many tasks to generate
+    and want to saturate all GPUs.
+
+    Usage:
+        pool = LLMClientPool(
+            model_path="models/Qwen3-8B",
+            gpu_ids=[0, 1, 2, 3],   # or "auto" to use CUDA_VISIBLE_DEVICES
         )
-        return response.choices[0].message.content or ""
+        results = pool.generate_batch(prompts=["prompt1", "prompt2", ...])
+        pool.shutdown()
+    """
 
+    def __init__(
+        self,
+        model_path: str,
+        gpu_ids: list[int] | str = "auto",
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+    ):
+        self.model_path = model_path
+        self.temperature = temperature
+        self.max_tokens = max_tokens
 
-def _extract_json(text: str) -> dict[str, Any]:
-    """Extract JSON object from text, handling markdown fences and think tags."""
-    # Strip Qwen3 <think>...</think> blocks
-    # 1. Remove closed <think>...</think>
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    # 2. If <think> is unclosed, strip from <think> to end
-    if "<think>" in text:
-        after_think = re.sub(r"<think>[\s\S]+", "", text)
-        text = after_think.strip() if after_think.strip() else ""
-    text = text.strip()
+        if gpu_ids == "auto":
+            n_gpus = int(os.environ.get("GPU_COUNT", torch.cuda.device_count()))
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if visible:
+                gpu_ids = [int(x) for x in visible.split(",")]
+            else:
+                gpu_ids = list(range(n_gpus))
 
-    # Try direct parse
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
+        if not gpu_ids:
+            raise ValueError("No GPUs available for LLMClientPool")
+
+        self.gpu_ids = gpu_ids
+        logger.info(f"LLMClientPool: {len(gpu_ids)} GPUs → {gpu_ids}")
+
+    def generate_batch(
+        self,
+        prompts: list[str],
+        batch_size: int | None = None,
+    ) -> list[str]:
+        """Generate responses for a list of prompts using all GPUs in parallel.
+
+        Args:
+            prompts: List of prompt strings
+            batch_size: Chunks per GPU (auto-computed if None)
+
+        Returns:
+            List of generated responses in the same order as prompts
+        """
+        if not prompts:
+            return []
+
+        n_gpus = len(self.gpu_ids)
+        if batch_size is None:
+            # Split evenly across GPUs
+            batch_size = max(1, len(prompts) // n_gpus)
+
+        # Split prompts into chunks for each GPU
+        chunks = [prompts[i::n_gpus] for i in range(n_gpus)]
+
+        # Launch one worker per GPU
+        ctx = mp.get_context("spawn")
+        manager = ctx.Manager()
+        result_queue = manager.Queue()
+
+        workers = []
+        for gpu_idx, chunk in enumerate(chunks):
+            if not chunk:
+                continue
+            p = ctx.Process(
+                target=_gpu_worker,
+                args=(
+                    gpu_idx, self.gpu_ids[gpu_idx], self.model_path,
+                    chunk, self.temperature, self.max_tokens, result_queue,
+                ),
+            )
+            p.start()
+            workers.append(p)
+
+        # Collect results
+        results: dict[int, str] = {}
+        for _ in range(len(prompts)):
+            idx, text = result_queue.get()
+            results[idx] = text
+
+        for p in workers:
+            p.join()
+
+        # Reconstruct original order
+        return [results[i] for i in range(len(prompts))]
+
+    def shutdown(self):
+        """No-op for now; workers are cleaned up after each generate_batch call."""
         pass
 
-    # Try markdown code fence
-    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-    if fence_match:
-        try:
-            return json.loads(fence_match.group(1).strip())
-        except json.JSONDecodeError:
-            pass
 
-    # Try to find JSON object boundaries (greedy: last { to first })
-    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
-    if brace_match:
-        try:
-            return json.loads(brace_match.group(0))
-        except json.JSONDecodeError:
-            pass
+def _gpu_worker(
+    gpu_idx: int,
+    device_id: int,
+    model_path: str,
+    prompts: list[str],
+    temperature: float,
+    max_tokens: int,
+    result_queue: mp.Queue,
+) -> None:
+    """Worker function that loads model on one GPU and processes prompts."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+    # Re-import after CUDA_VISIBLE_DEVICES is set
+    import torch
+    from transformers import pipeline, AutoTokenizer
 
-    raise ValueError(f"Could not extract valid JSON from: {text[:200]}...")
+    logger.info(f"[GPU {device_id}] Loading model: {model_path}")
+    pipe = pipeline(
+        "text-generation",
+        model=model_path,
+        trust_remote_code=True,
+        device_map={"": "cuda:0"},  # CUDA_VISIBLE_DEVICES remaps → always cuda:0 in child
+        torch_dtype=torch.bfloat16,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+    for i, prompt in enumerate(prompts):
+        global_idx = gpu_idx + i * len(prompts)  # approximate global index
+        try:
+            if tokenizer.chat_template:
+                formatted = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False, add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            else:
+                formatted = prompt
+
+            result = pipe(
+                formatted,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                do_sample=temperature > 0,
+                top_p=0.95,
+                return_full_text=False,
+            )
+            text = result[0]["generated_text"]
+            # Strip <｜end▁of▁thinking｜>
+            if "<｜end▁of▁thinking｜>" in text:
+                text = text.split(" response")[-1].strip()
+            logger.debug(f"[GPU {device_id}] {i}/{len(prompts)} done")
+        except Exception as e:
+            logger.error(f"[GPU {device_id}] Error on prompt {i}: {e}")
+            text = ""
+
+        result_queue.put((global_idx, text))
+
+    logger.info(f"[GPU {device_id}] Done ({len(prompts)} prompts)")

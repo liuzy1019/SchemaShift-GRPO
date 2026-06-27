@@ -19,7 +19,7 @@ from typing import Iterable
 from loguru import logger
 
 
-SKIP_ENV = "SCHEMASHIFT_SKIP_LENGTH_CHECK"
+SKIP_ENV = "LIVEMCP_SKIP_LENGTH_CHECK"
 SOFT_RATIO = 0.95
 
 
@@ -157,7 +157,7 @@ def parse_data_args_from_argv(argv: list[str]) -> dict:
 def maybe_run_length_check(argv: list[str]) -> None:
     """训练入口在调 verl 前调用一次。
 
-    默认开启；SCHEMASHIFT_SKIP_LENGTH_CHECK=1 时跳过。
+    默认开启；LIVEMCP_SKIP_LENGTH_CHECK=1 时跳过。
     校验失败抛 RuntimeError，阻止 verl 启动。"""
     if os.environ.get(SKIP_ENV, "0") == "1":
         logger.warning(f"{SKIP_ENV}=1，跳过数据长度预检")

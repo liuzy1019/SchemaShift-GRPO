@@ -34,9 +34,6 @@ tools:
     - update_order_status
     - cancel_order
 
-sampler:
-  class_path: src.live_mcp.sampler.FoodDeliverySampler
-
 reward_profile: food_delivery_basic
 
 dependency_graph:

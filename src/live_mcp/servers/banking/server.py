@@ -103,6 +103,7 @@ class BankingServer(StatefulToolServer):
     def deposit(self, session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
         state = self._state(session_id); aid, amount = arguments["account_id"], float(arguments["amount"])
         acct = self._acct(state, aid)
+        if acct.get("frozen"): raise KeyError(f"account frozen: {aid}")
         if amount <= 0: raise KeyError("amount must be positive")
         acct["balance"] += amount
         tid = self._txn_id(state); txn = {"txn_id": tid, "to_account": aid, "amount": amount, "currency": acct["currency"], "type": "deposit", "source": arguments.get("source", "branch"), "timestamp": "2026-06-24"}

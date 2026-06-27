@@ -1,0 +1,21 @@
+{
+  "run_id": "2026-06-26_8B_full_20260626",
+  "command": "scripts/generate_data.py --domain all --count 200 --val-count 20 --model models/Qwen/Qwen3-8B --output data/runs/8B/oval_grpo_train.parquet --val-output data/runs/8B/oval_grpo_val.parquet --experiment-tag 8B_full_20260626 --log-file data/runs/8B/generate.log",
+  "model": "models/Qwen/Qwen3-8B",
+  "api_base": "local",
+  "domain": "all",
+  "count": 200,
+  "val_count": 20,
+  "seed": 42,
+  "distractor_rate": 0.4,
+  "missing_function_rate": 0.2,
+  "irrelevance_ratio": 0.05,
+  "difficulty_mix": {
+    "complete": 0.6,
+    "missing": 0.2,
+    "minimal": 0.2
+  },
+  "git_commit": "7bb43b3",
+  "gpu_model": "NVIDIA A10",
+  "timestamp": "2026-06-26T09:59:23.242180+00:00"
+}

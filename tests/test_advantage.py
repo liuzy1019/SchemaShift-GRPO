@@ -1,16 +1,16 @@
 """
-SchemaShift advantage 单元测试。
+LiveMCP advantage 单元测试。
 """
 import torch
 import pytest
-from src.training.schemashift_advantage import (
-    compute_schemashift_advantages,
+from src.training.livemcp_advantage import (
+    compute_livemcp_advantages,
     compute_standard_grpo_advantages,
 )
 
 
-class TestComputeSchemashiftAdvantages:
-    """compute_schemashift_advantages 功能测试。"""
+class TestComputeLiveMCPAdvantages:
+    """compute_livemcp_advantages 功能测试。"""
 
     def test_basic_3x3(self):
         """3:3:3 分组的基本测试。"""
@@ -21,7 +21,7 @@ class TestComputeSchemashiftAdvantages:
         )
         levels = ["none"] * 3 + ["mild"] * 3 + ["strong"] * 3
 
-        adv = compute_schemashift_advantages(rewards, levels)
+        adv = compute_livemcp_advantages(rewards, levels)
 
         assert adv.shape == (9,), f"输出形状应为 (9,)，实际为 {adv.shape}"
         # 每个层级内应该有正负 advantage
@@ -38,7 +38,7 @@ class TestComputeSchemashiftAdvantages:
         )
         levels = ["none"] * 2 + ["mild"] * 2 + ["strong"] * 2
 
-        adv = compute_schemashift_advantages(rewards, levels, beta=0.0)
+        adv = compute_livemcp_advantages(rewards, levels, beta=0.0)
 
         # beta=0.0 表示只看层内比较
         # strong 层内 reward=0.3 的应该拿到正 advantage
@@ -49,7 +49,7 @@ class TestComputeSchemashiftAdvantages:
         rewards = torch.tensor([0.6, 0.5, 0.4])
         levels = ["none"] * 3
 
-        adv = compute_schemashift_advantages(rewards, levels, beta=0.0)
+        adv = compute_livemcp_advantages(rewards, levels, beta=0.0)
         assert adv[0] > adv[1] > adv[2]
 
     def test_cross_level_correction(self):
@@ -60,10 +60,10 @@ class TestComputeSchemashiftAdvantages:
         )
         levels = ["none"] * 2 + ["strong"] * 2
 
-        adv_level_only = compute_schemashift_advantages(
+        adv_level_only = compute_livemcp_advantages(
             rewards, levels, beta=0.0
         )
-        adv_full = compute_schemashift_advantages(
+        adv_full = compute_livemcp_advantages(
             rewards, levels, beta=0.25
         )
 
@@ -77,7 +77,7 @@ class TestComputeSchemashiftAdvantages:
         rewards = torch.tensor([0.9, 0.8, 0.7, 0.6])
         levels = ["none"] * 4  # 只有 none
 
-        adv = compute_schemashift_advantages(rewards, levels)
+        adv = compute_livemcp_advantages(rewards, levels)
         assert adv.shape == (4,)
 
     def test_length_mismatch(self):
@@ -86,7 +86,7 @@ class TestComputeSchemashiftAdvantages:
         levels = ["none"]
 
         with pytest.raises(ValueError):
-            compute_schemashift_advantages(rewards, levels)
+            compute_livemcp_advantages(rewards, levels)
 
     def test_beta_extremes(self):
         """beta=0 退化为纯层内归一化（只减层均值，无全局残差）。"""
@@ -94,7 +94,7 @@ class TestComputeSchemashiftAdvantages:
         levels = (["none"] * 2 + ["mild"] * 2 + ["strong"] * 2)
 
         adv_grpo = compute_standard_grpo_advantages(rewards)
-        adv_schema = compute_schemashift_advantages(
+        adv_schema = compute_livemcp_advantages(
             rewards, levels, beta=0.0
         )
 
@@ -110,7 +110,7 @@ class TestComputeSchemashiftAdvantages:
         )
         levels = ["none"] * 3 + ["mild"] * 3 + ["strong"] * 3
 
-        adv = compute_schemashift_advantages(rewards, levels)
+        adv = compute_livemcp_advantages(rewards, levels)
 
         # 所有值应为有限数
         assert torch.all(torch.isfinite(adv))

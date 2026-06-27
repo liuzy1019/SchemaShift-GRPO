@@ -35,9 +35,6 @@ tools:
     - create_deal
     - update_deal
 
-sampler:
-  class_path: src.live_mcp.sampler.CRMSampler
-
 reward_profile: crm_basic
 
 dependency_graph:

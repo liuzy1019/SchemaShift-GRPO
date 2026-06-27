@@ -63,8 +63,12 @@ class PaymentsServer(StatefulToolServer):
         if inv["status"] != "paid": raise KeyError(f"cannot refund invoice in status: {inv['status']}")
         amount = float(arguments["amount"])
         if amount > inv["amount"]: raise KeyError(f"refund exceeds invoice: {amount} > {inv['amount']}")
+        # Track cumulative refunds to prevent over-refunding
+        total_refunded = inv.get("total_refunded", 0.0)
+        if amount + total_refunded > inv["amount"]:
+            raise KeyError(f"cumulative refunds ({amount} + {total_refunded}) exceed invoice amount {inv['amount']}")
         rid = f"ref_{state['next_ref_num']:04d}"; state["next_ref_num"] += 1
-        inv["status"] = "refunded"; inv["refund_id"] = rid
+        inv["status"] = "refunded"; inv["refund_id"] = rid; inv["total_refunded"] = total_refunded + amount
         state["refunds"][rid] = {"refund_id": rid, "invoice_id": inv_id, "amount": amount, "reason": arguments.get("reason", "")}
         return _result(True, {"invoice": inv, "refund": state["refunds"][rid]}, None, "", True)
 
@@ -72,8 +76,10 @@ class PaymentsServer(StatefulToolServer):
         state = self._state(session_id); pid = arguments["payment_id"]; pmt = state["payments"].get(pid)
         if not pmt: raise KeyError(f"payment not found: {pid}")
         if pmt["status"] != "settled": raise KeyError(f"payment already {pmt['status']}")
+        inv = state["invoices"][pmt["invoice_id"]]
+        if inv.get("refund_id"): raise KeyError(f"cannot cancel refunded invoice: {inv['refund_id']}")
         pmt["status"] = "cancelled"; pmt["cancel_reason"] = arguments.get("reason", "")
-        inv = state["invoices"][pmt["invoice_id"]]; inv["status"] = "pending"; inv["payment_id"] = None
+        inv["status"] = "pending"; inv["payment_id"] = None
         return _result(True, {"payment": pmt, "invoice_status": "pending"}, None, "", True)
 
     def dispute_invoice(self, session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:

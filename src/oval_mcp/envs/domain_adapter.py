@@ -600,8 +600,13 @@ class FilesystemAdapter(DomainAdapter):
             result["changed_fields"] = ["permissions"]
             old_mode = observation.get("old_mode", "") if isinstance(observation, dict) else ""
             new_mode = tool_arguments.get("mode", "") if isinstance(tool_arguments, dict) else ""
-            if old_mode and new_mode and int(new_mode, 8) > int(old_mode, 8):
-                result["forbidden_transition"] = "permission_escalation"
+            try:
+                old_oct = int(str(old_mode), 8) if old_mode else 0
+                new_oct = int(str(new_mode), 8) if new_mode else 0
+                if old_oct and new_oct and new_oct > old_oct:
+                    result["forbidden_transition"] = "permission_escalation"
+            except (ValueError, TypeError):
+                pass  # non-octal mode values — skip escalation check
         elif tool_name == "mv":
             result["target_id"] = tool_arguments.get("source", "")
             result["changed_fields"] = ["path"]
