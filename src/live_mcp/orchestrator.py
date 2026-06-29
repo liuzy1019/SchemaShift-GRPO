@@ -22,6 +22,7 @@ from src.live_mcp.dedup import dedup_tasks
 from src.live_mcp.executor import LiveMCPExecutor
 from src.live_mcp.manager import LiveMCPManager
 from src.live_mcp.types import LiveTask, OracleCall, OracleProgram, to_plain
+from src.utils import extract_json as _extract_json
 
 
 class TaskOrchestrator:
@@ -50,7 +51,8 @@ class TaskOrchestrator:
         self.manager = manager
         self.executor = executor
         self.client = client
-        self._domain_graphs: dict[str, dict] = {}  # cached dependency graphs per domain
+        self._domain_graphs: dict[str, dict] = {}     # cached dependency graphs per domain
+        self._domain_chains: dict[str, list] = {}     # cached length-2 to length-5 chains
 
     def generate_one(
         self,
@@ -61,138 +63,295 @@ class TaskOrchestrator:
     ) -> LiveTask:
         """PROVE-style state-machine generation with LLM-in-the-loop.
 
-        1. LLM generates user_query
-        2. Loop: LLM decides next action (tool_call with args, or terminal)
-           → execute tool against live MCP → apply perturbation → record
-        3. Derive success criteria from state delta
-        4. Replay validate against fresh session
+        1. Sample dependency chain seed (PROVE §6 step 2)
+        2. LLM generates user_query with persona + reference_date (PROVE §4)
+        3. Turn-decay loop (min_turns≈chain_len, max_turns≈chain_len+2)
+           LLM decides next action → execute → apply perturbation → recovery → record
+        4. Derive success criteria from state delta
+        5. Replay validate against fresh session
+
+        Retries with different seed if oracle_calls is empty or replay fails.
         """
         from src.live_mcp.task_planner import (
             TaskPlanner, derive_success_criteria, replay_validate, apply_perturbation,
+            _PERSONA_TEMPLATES, _REFERENCE_DATES, ContinuationPolicy,
+            provenance_check,
         )
         from src.live_mcp.types import ToolCall
 
-        teacher = TaskPlanner(self.client, server_name)
         rng = random.Random(seed)
 
-        # ── PROVE Step 1: auto-discover dependency graph (cached per domain) ──
-        dep_hints = self._get_graph_hints(server_name)
+        # ── Sample diversity injectors (PROVE §4) ──
+        persona = _PERSONA_TEMPLATES[seed % len(_PERSONA_TEMPLATES)]
+        reference_date = _REFERENCE_DATES[(seed // len(_PERSONA_TEMPLATES)) % len(_REFERENCE_DATES)]
 
-        # ── Step 2: generate user query ──
-        session = self.manager.create_session(seed=seed)
-        session_id = session.session_id
-        all_tools = self.manager.discover_tools(session_id)
-        server_tools = [
-            tool for tool in all_tools
-            if self.manager.registry.server_for_tool(tool["name"]) == server_name
-        ]
+        # ── Sample dependency chain seed (PROVE §6 step 2) ──
+        chains = self._get_chains(server_name)
+        chain_seed: list[str] | None = None
+        if chains and rng.random() < 0.80:  # 80% of tasks have a chain seed
+            chain_seed = rng.choice(chains)
 
-        try:
-            grounded_state = self.manager.get_state(session_id)
-            domain_state = grounded_state.get(server_name, {})
-            initial_state_snapshot = copy.deepcopy(domain_state)
+        # ── Retry with different seed if LLM refuses to call tools ──
+        for retry_attempt in range(3):
+            local_seed = seed + retry_attempt * 1000
+            local_rng = random.Random(local_seed)
 
-            user_query = teacher.generate_query(
-                tool_schemas=server_tools,
-                grounded_state=domain_state,
-                difficulty=difficulty,
-                rng=rng,
-                dep_hints=dep_hints,
-            )
+            teacher = TaskPlanner(self.client, server_name, seed=local_seed)
 
-            # ── Step 2-N: state-machine loop ──
-            oracle_calls: list[OracleCall] = []
-            execution_history: list[dict[str, Any]] = []
-            required_tools: set[str] = set()
-            task_id = f"{server_name}_{seed}_{rng.randint(0, 99999)}"
+            session = self.manager.create_session(seed=local_seed)
+            session_id = session.session_id
+            all_tools = self.manager.discover_tools(session_id)
+            server_tools = self.manager.registry.server_tools(server_name)
 
-            for turn in range(max_turns):
-                action = teacher.decide_action(
+            try:
+                grounded_state = self.manager.get_state(session_id)
+                domain_state = grounded_state.get(server_name, {})
+                initial_state_snapshot = copy.deepcopy(domain_state)
+
+                dep_hints = self._get_graph_hints(server_name)
+
+                user_query = teacher.generate_query(
                     tool_schemas=server_tools,
-                    user_query=user_query,
-                    execution_history=execution_history,
-                    attempt=turn,
+                    grounded_state=domain_state,
+                    difficulty=difficulty,
+                    rng=local_rng,
                     dep_hints=dep_hints,
+                    persona=persona,
+                    reference_date=reference_date,
+                    chain_seed=chain_seed,
                 )
 
-                if action.action in ("final_answer", "report_error", "ask_clarification"):
-                    break  # terminal
+                oracle_calls: list[OracleCall] = []
+                execution_history: list[dict[str, Any]] = []
+                required_tools: set[str] = set()
+                task_id = f"{server_name}_{local_seed}_{local_rng.randint(0, 99999)}"
+                retry_label = f" (retry {retry_attempt})" if retry_attempt > 0 else ""
 
-                if action.action != "tool_call" or not action.tool_name:
-                    continue  # unparseable → skip, LLM will retry next turn
-
-                tool_name = action.tool_name
-                tool_name = _fuzzy_match_tool(tool_name, {t["name"] for t in server_tools}) or tool_name
-                required_tools.add(tool_name)
-
-                # Execute the tool call
-                result = self.executor.execute(
-                    session_id,
-                    ToolCall(tool_name, dict(action.arguments), call_id=f"sm_{turn}"),
+                # Turn-decay schedule (PROVE §6)
+                target_turns = ContinuationPolicy.target_turns(
+                    len(chain_seed) if chain_seed else 3, local_rng,
                 )
+                max_turns = min(target_turns + 2, 8)  # allow perturbations to add turns
 
-                # Apply execution perturbation (PROVE-style)
-                perturbed_obs = apply_perturbation(
-                    result.observation, server_name, rng,
-                )
-                if isinstance(perturbed_obs, dict) and perturbed_obs.get("retry"):
-                    # Intermittent error → oracle retries, don't record as oracle call yet
+                for turn in range(max_turns):
+                    action = teacher.decide_action(
+                        tool_schemas=server_tools,
+                        user_query=user_query,
+                        execution_history=execution_history,
+                        attempt=turn,
+                        dep_hints=dep_hints,
+                        difficulty=difficulty,
+                    )
+
+                    if action.action == "ask_clarification":
+                        # For 'missing' difficulty, ask_clarification is the expected
+                        # first action — record it as a valid oracle step.
+                        # For other difficulties, it signals inability to proceed
+                        # and will trigger retry (oracle_calls will be empty).
+                        if difficulty == "missing":
+                            oracle_calls.append(OracleCall(
+                                tool_name="ask_clarification",
+                                arguments={"question": action.text},
+                                action="clarification",
+                            ))
+                        break
+
+                    if action.action in ("final_answer", "report_error"):
+                        break
+
+                    if action.action != "tool_call" or not action.tool_name:
+                        continue
+
+                    tool_name = action.tool_name
+                    tool_name = _fuzzy_match_tool(tool_name, {t["name"] for t in server_tools}) or tool_name
+                    required_tools.add(tool_name)
+
+                    result = self.executor.execute(
+                        session_id,
+                        ToolCall(tool_name, dict(action.arguments), call_id=f"sm_{turn}"),
+                        domain=server_name,
+                    )
+
+                    perturbed_obs = apply_perturbation(
+                        result.observation, server_name, local_rng,
+                    )
+
+                    # ── Intermittent error perturbation: real execution succeeded,
+                    #     but the model sees a fake error. Do NOT re-execute —
+                    #     state side effects already committed. Record the real
+                    #     success in oracle_calls and the perturbed obs in history.
+                    if isinstance(perturbed_obs, dict) and perturbed_obs.get("retry"):
+                        execution_history.append({
+                            "tool_name": tool_name,
+                            "arguments": dict(action.arguments),
+                            "observation": perturbed_obs,
+                            "success": False,
+                        })
+                        oracle_calls.append(OracleCall(
+                            tool_name=tool_name,
+                            arguments=dict(action.arguments),
+                        ))
+                        # Continue to next turn — model sees the error
+                        # and will decide whether to retry on its own.
+                        continue
+
+                    # ── PROVE recovery: explicit retry states on genuine failure ──
+                    if not result.success:
+                        execution_history.append({
+                            "tool_name": tool_name,
+                            "arguments": dict(action.arguments),
+                            "observation": perturbed_obs if perturbed_obs is not None else result.observation,
+                            "success": False,
+                        })
+
+                        # Run recovery decision (PROVE §6 step 5a)
+                        recovery = teacher.decide_recovery(
+                            last_tool_name=tool_name,
+                            last_arguments=dict(action.arguments),
+                            error_observation=perturbed_obs if perturbed_obs is not None else {"error": str(result.observation)},
+                            tool_schemas=server_tools,
+                            execution_history=execution_history,
+                        )
+                        rec_action = recovery.get("action", "give_up")
+
+                        if rec_action == "give_up":
+                            break  # unrecoverable, end conversation
+                        elif rec_action in ("retry", "retry_same"):
+                            # Retry with corrected (or same) args → execute as new turn
+                            corrected = recovery.get("corrected_args", dict(action.arguments))
+                            retry_result = self.executor.execute(
+                                session_id,
+                                ToolCall(tool_name, corrected, call_id=f"sm_recover_{turn}"),
+                                domain=server_name,
+                            )
+                            if retry_result.success:
+                                execution_history.append({
+                                    "tool_name": tool_name,
+                                    "arguments": corrected,
+                                    "observation": retry_result.observation if retry_result.observation is not None else {},
+                                    "success": True,
+                                })
+                                oracle_calls.append(OracleCall(
+                                    tool_name=tool_name,
+                                    arguments=corrected,
+                                ))
+                        elif rec_action == "retry_alt":
+                            # Try alternative tool
+                            alt_tool = recovery.get("tool_name", "")
+                            if alt_tool and alt_tool in {t["name"] for t in server_tools}:
+                                alt_result = self.executor.execute(
+                                    session_id,
+                                    ToolCall(alt_tool, recovery.get("arguments", {}), call_id=f"sm_alt_{turn}"),
+                                    domain=server_name,
+                                )
+                                if alt_result.success:
+                                    required_tools.add(alt_tool)
+                                    execution_history.append({
+                                        "tool_name": alt_tool,
+                                        "arguments": recovery.get("arguments", {}),
+                                        "observation": alt_result.observation if alt_result.observation is not None else {},
+                                        "success": True,
+                                    })
+                                    oracle_calls.append(OracleCall(
+                                        tool_name=alt_tool,
+                                        arguments=recovery.get("arguments", {}),
+                                    ))
+                        continue
+
+                    # ── Successful execution ──
+                    obs_to_record = perturbed_obs if perturbed_obs is not None else result.observation
                     execution_history.append({
                         "tool_name": tool_name,
                         "arguments": dict(action.arguments),
-                        "observation": perturbed_obs,
-                        "success": False,
+                        "observation": obs_to_record if obs_to_record is not None else {},
+                        "success": True,
                     })
-                    continue
 
-                execution_history.append({
-                    "tool_name": tool_name,
-                    "arguments": dict(action.arguments),
-                    "observation": perturbed_obs if perturbed_obs is not None else result.observation,
-                    "success": result.success,
-                })
-                if not result.success:
-                    continue  # LLM sees the failure, can retry. Not part of oracle.
+                    oracle_calls.append(OracleCall(
+                        tool_name=tool_name,
+                        arguments=dict(action.arguments),
+                    ))
 
-                oracle_calls.append(OracleCall(
-                    tool_name=tool_name,
-                    arguments=dict(action.arguments),
-                ))
+                    # Continuation check (PROVE turn-decay)
+                    if not ContinuationPolicy.should_continue(
+                        turn, target_turns, result.success, len(oracle_calls),
+                    ):
+                        break
 
-            # ── Step: derive success criteria from state delta ──
-            final_state_full = self.manager.get_state(session_id)
-            final_state = final_state_full.get(server_name, {})
-            success_criteria = derive_success_criteria(
-                initial_state=initial_state_snapshot,
-                final_state=final_state,
-                oracle_calls=oracle_calls,
-                domain=server_name,
-            )
+                # ── If oracle_calls still empty after retries, raise ──
+                if not oracle_calls:
+                    if retry_attempt < 2:
+                        logger.debug(
+                            f"No tool calls recorded for {server_name}{retry_label}, "
+                            f"retrying with new seed ({retry_attempt + 1}/3)"
+                        )
+                        self.manager.close_session(session_id)
+                        continue
+                    raise RuntimeError(
+                        f"No tool calls recorded for {server_name} task {task_id} "
+                        f"(LLM answered without using tools)"
+                    )
 
-            # ── Step: replay validate ──
-            valid = replay_validate(
-                oracle_calls=oracle_calls,
-                manager=self.manager,
-                executor=self.executor,
-                seed=seed,
-                domain=server_name,
-            )
-            if not valid and oracle_calls:
-                raise RuntimeError(
-                    f"Replay validation failed for {server_name} task {task_id}"
+                # ── Derive success criteria from state delta ──
+                final_state_full = self.manager.get_state(session_id)
+                final_state = final_state_full.get(server_name, {})
+                success_criteria = derive_success_criteria(
+                    initial_state=initial_state_snapshot,
+                    final_state=final_state,
+                    oracle_calls=oracle_calls,
+                    domain=server_name,
                 )
 
-        finally:
-            self.manager.close_session(session_id)
+                # ── Replay validate (PROVE §3.2 Step 5: ≤30% error rate) ──
+                valid, error_rate, num_errors, num_calls = replay_validate(
+                    oracle_calls=oracle_calls,
+                    manager=self.manager,
+                    executor=self.executor,
+                    seed=local_seed,
+                    domain=server_name,
+                )
+                if not valid:
+                    if retry_attempt < 2:
+                        logger.debug(
+                            f"Replay validation failed for {server_name}: "
+                            f"{num_errors}/{num_calls} errors ({error_rate:.0%}), "
+                            f"retrying (attempt {retry_attempt + 1}/3)"
+                        )
+                        self.manager.close_session(session_id)
+                        continue
+                    raise RuntimeError(
+                        f"Replay validation failed for {server_name} task {task_id}: "
+                        f"{num_errors}/{num_calls} errors ({error_rate:.0%})"
+                    )
 
-        # ── Validate: PROVE-style tasks require at least one tool call ──
-        if not oracle_calls:
-            raise RuntimeError(
-                f"No tool calls recorded for {server_name} task {task_id} "
-                f"(LLM answered without using tools — task is not a valid "
-                f"tool-use training example)"
-            )
+                # ── Provenance check (PROVE §3.2 Step 5: sensitive params) ──
+                prov_ok, prov_violations = provenance_check(
+                    oracle_calls=oracle_calls,
+                    user_query=user_query,
+                    execution_history=execution_history,
+                )
+                if not prov_ok:
+                    if retry_attempt < 2:
+                        logger.debug(
+                            f"Provenance check failed for {server_name}: "
+                            f"{len(prov_violations)} untraceable sensitive params "
+                            f"(e.g., {prov_violations[0]['param']} in {prov_violations[0]['tool']}), "
+                            f"retrying (attempt {retry_attempt + 1}/3)"
+                        )
+                        self.manager.close_session(session_id)
+                        continue
+                    raise RuntimeError(
+                        f"Provenance check failed for {server_name} task {task_id}: "
+                        f"{len(prov_violations)} untraceable sensitive params"
+                    )
 
+                # ── Success ──
+                break
+
+            finally:
+                self.manager.close_session(session_id)
+
+        # ── Build final task ──
         oracle_program = OracleProgram(
             task_id=task_id,
             calls=oracle_calls,
@@ -201,7 +360,7 @@ class TaskOrchestrator:
 
         return self._to_live_task(
             server_name=server_name, query=user_query,
-            session_id=session_id, seed=seed,
+            session_id=session_id, seed=local_seed,
             all_tools=all_tools, oracle_program=oracle_program,
             required_tools=sorted(required_tools),
             difficulty=difficulty, task_id=task_id,
@@ -232,61 +391,70 @@ class TaskOrchestrator:
         n_irrelevant = round(count * irrelevance_ratio) if irrelevance_ratio > 0 else 0
         n_normal = count - n_irrelevant
 
-        idx = 0
+        # Per-domain budget: each domain gets its fair share (PROVE uniform distribution)
+        per_domain = n_normal // len(servers)
+        remainder = n_normal % len(servers)
+        global_seed_offset = 0
         failed = 0
-        domain_failures: dict[str, int] = {}
-        domain_cooldown_until: dict[str, int] = {}
-        # After 3 consecutive failures, skip the domain for this many rounds
-        # before retrying (increases with each cooldown cycle)
-        base_cooldown = len(servers) * 2
 
-        # ── normal task generation ──
-        while len(tasks) < n_normal and failed < count * 2:
-            current_server = servers[idx % len(servers)]
-            cooldown_end = domain_cooldown_until.get(current_server, 0)
-            if idx < cooldown_end:
-                idx += 1
-                continue
-            if idx >= cooldown_end and cooldown_end > 0:
-                # Cooldown expired, reset failure count and let it retry
-                domain_cooldown_until.pop(current_server, None)
-                domain_failures[current_server] = 0
-            difficulty = self._pick_difficulty(seed + idx, effective_mix)
-            try:
-                task = self.generate_one(
-                    current_server, seed=seed + idx, difficulty=difficulty,
-                )
-                # Robustness knobs at configurable rates
-                rng_knob = random.Random(seed + idx)
-                if rng_knob.random() < distractor_rate:
-                    self._apply_distractors(task)
-                if rng_knob.random() < missing_function_rate:
-                    self._apply_missing_function(task)
-                tasks.append(task)
-                if len(tasks) % 10 == 0:
-                    progress_msg = (
-                        f"[generate_many] {len(tasks)}/{n_normal} tasks, "
-                        f"{failed} failures"
-                    )
-                    print(progress_msg, flush=True)
-                    logger.info(progress_msg)
-            except Exception as e:
-                failed += 1
-                domain_failures[current_server] = domain_failures.get(current_server, 0) + 1
-                logger.warning(
-                    f"generate failed for {current_server} "
-                    f"({domain_failures[current_server]}x): {e}"
-                )
-                if domain_failures[current_server] >= 3:
-                    cooldown = base_cooldown * (2 ** (domain_failures[current_server] // 3 - 1))
-                    max_cooldown = max(200, len(servers) * 10)
-                    cooldown = min(cooldown, max_cooldown)
-                    domain_cooldown_until[current_server] = idx + cooldown
+        # ── tqdm progress bar ──
+        try:
+            from tqdm import tqdm as _tqdm
+            pbar = _tqdm(total=n_normal, desc="[generate_many]", unit="task",
+                         dynamic_ncols=True, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+        except ImportError:
+            pbar = None
+
+        # ── normal task generation: per-domain budget ──
+        for si, current_server in enumerate(servers):
+            domain_target = per_domain + (1 if si < remainder else 0)
+            domain_ok = 0
+            domain_failed = 0
+            max_domain_failures = max(domain_target * 2, 5)
+
+            for _attempt in range(domain_target + max_domain_failures):
+                if domain_ok >= domain_target:
+                    break
+                if domain_failed >= max_domain_failures:
                     logger.warning(
-                        f"cooling down {current_server} for {cooldown} rounds "
-                        f"(retry at round {idx + cooldown})"
+                        f"{current_server}: gave up after {domain_failed} failures, "
+                        f"got {domain_ok}/{domain_target}"
                     )
-            idx += 1
+                    break
+
+                task_seed = seed + global_seed_offset
+                global_seed_offset += 1
+                difficulty = self._pick_difficulty(task_seed, effective_mix)
+                try:
+                    task = self.generate_one(
+                        current_server, seed=task_seed, difficulty=difficulty,
+                    )
+                    rng_knob = random.Random(task_seed)
+                    if rng_knob.random() < distractor_rate:
+                        self._apply_distractors(task)
+                    if rng_knob.random() < missing_function_rate:
+                        self._apply_missing_function(task)
+                    tasks.append(task)
+                    domain_ok += 1
+                    if pbar:
+                        pbar.update(1)
+                        pbar.set_postfix_str(f"fail={failed}")
+                    elif len(tasks) % 10 == 0:
+                        print(f"[generate_many] {len(tasks)}/{n_normal} tasks, {failed} failures", flush=True)
+                    if len(tasks) % 10 == 0:
+                        logger.info(f"generate_many progress: {len(tasks)}/{n_normal} tasks, {failed} failures")
+                except Exception as e:
+                    failed += 1
+                    domain_failed += 1
+                    if pbar:
+                        pbar.set_postfix_str(f"fail={failed}")
+                    logger.warning(
+                        f"generate failed for {current_server} "
+                        f"({domain_failed}x): {e}"
+                    )
+
+        if pbar:
+            pbar.close()
 
         # ── irrelevance tasks (5%) ──
         irr = self._generate_irrelevant_tasks(n_irrelevant, seed + 9999)
@@ -297,6 +465,26 @@ class TaskOrchestrator:
         tasks = dedup_tasks(tasks, threshold=0.70)
         removed = before - len(tasks)
 
+        # P1-6: surface low yield to the caller. With irrelevance_ratio<1,
+        # the contractual target is `count` rows; falling far short almost
+        # always means the teacher LLM/MCP server pipeline is broken. We
+        # warn loudly at <50% and raise at 0% so that callers don't
+        # silently write empty Parquet files.
+        # Skip the guard entirely when the caller explicitly asked for 0
+        # tasks (e.g. val-only or train-only generation).
+        if count > 0 and not tasks:
+            raise RuntimeError(
+                f"generate_many produced 0 tasks (target {count}, "
+                f"failures={failed}, dedup_removed={removed}). "
+                f"Check teacher LLM connectivity and MCP servers."
+            )
+        if count > 0 and len(tasks) < max(1, count // 2):
+            logger.error(
+                f"generate_many SEVERE under-yield: got {len(tasks)}/{count} "
+                f"({failed} failures, {removed} dedup_removed). "
+                f"Inspect logs for repeated teacher errors."
+            )
+
         logger.info(
             f"LLM teacher: {len(tasks)} tasks (target {count}, {failed} failures, "
             f"{removed} dedup removed)"
@@ -306,9 +494,17 @@ class TaskOrchestrator:
     def _to_live_task(self, server_name: str, query: str, session_id: str, seed: int,
                       all_tools: list[dict], oracle_program, required_tools: list[str],
                       difficulty: str, task_id: str) -> LiveTask:
-        visible_tools = [t for t in all_tools if t["name"] in required_tools]
+        if required_tools:
+            # Show all domain tools — model must figure out which to use.
+            # Don't leak required_tools by only showing those.
+            all_domain_tools = self.manager.registry.server_tools(server_name)
+            visible_tools = all_domain_tools if all_domain_tools else [t for t in all_tools if t["name"] in required_tools]
+        else:
+            # Clarification-only tasks (missing difficulty): expose all tools
+            # so the agent can see what's available to identify the missing param
+            visible_tools = all_tools
         return LiveTask(
-            task_id=f"{server_name}_{seed}_{task_id}", source="live_mcp_task_planner",
+            task_id=task_id, source="live_mcp_task_planner",
             suite_name=self.suite_config.suite_name, user_prompt=query,
             session_id=session_id, session_seed=seed, target_servers=[server_name],
             visible_tools=visible_tools, required_tools=list(required_tools),
@@ -342,6 +538,22 @@ class TaskOrchestrator:
         task.metadata["original_oracle_program"] = to_plain(task.oracle_program)
         task.hidden_tools.append(hidden)
         task.visible_tools = [t for t in task.visible_tools if t["name"] != hidden]
+
+        # Guard: ensure visible_tools never empty — otherwise _tasks_to_rows
+        # silently drops the task. Add cross-domain distractor tools as fallback.
+        if not task.visible_tools:
+            import hashlib
+            known = set(task.hidden_tools) | {hidden}
+            candidates = [t for t in self.manager.registry.all_tools()
+                          if t["name"] not in known]
+            seed_bytes = hashlib.md5(task.task_id.encode()).digest()
+            rng = random.Random(int.from_bytes(seed_bytes[:8], "big"))
+            if candidates:
+                selected = rng.sample(candidates, min(len(candidates), rng.randint(3, 8)))
+                task.visible_tools = selected
+                task.metadata["has_distractors"] = True
+                task.metadata["distractor_count"] = len(selected)
+
         task.required_tools = [n for n in task.required_tools if n != hidden]
         task.success_criteria = [missing]
         task.expected_outcome = {"success_criteria": [missing], "abstain": True}
@@ -381,7 +593,7 @@ class TaskOrchestrator:
                 session_id="",
                 session_seed=seed + i,
                 target_servers=[server_name],
-                visible_tools=self.manager.registry.all_tools(),
+                visible_tools=self.manager.registry.server_tools(server_name),
                 required_tools=[],
                 expected_outcome={"abstain": True},
                 success_criteria=[missing],
@@ -458,15 +670,102 @@ class TaskOrchestrator:
                 return name
         return next(iter(sorted(difficulty_mix)))
 
+    def _maybe_load_cached_graph(self, server_name: str) -> dict | None:
+        """Load precomputed LLM dependency graph from disk cache.
+
+        Cache files live in ``data/dependency_graphs/{domain}.json``.
+        These are produced by running ``_classify_edges_llm`` offline
+        (e.g., via ``scripts/precompute_graphs.py``).
+
+        Returns None if cache doesn't exist or is invalid.
+        """
+        from pathlib import Path
+        cache_dir = Path("data/dependency_graphs")
+        cache_path = cache_dir / f"{server_name}.json"
+        if not cache_path.exists():
+            return None
+        try:
+            import json as _json
+            data = _json.loads(cache_path.read_text())
+            if not isinstance(data, dict) or not data:
+                return None
+            # Validate structure
+            for tool_name, edges in data.items():
+                if not isinstance(edges, dict):
+                    return None
+                if "explicit" not in edges or "implicit" not in edges:
+                    return None
+            logger.info(f"Loaded cached LLM dependency graph: {cache_path}")
+            return data
+        except Exception as e:
+            logger.warning(f"Failed to load cached graph {cache_path}: {e}")
+            return None
+
+    def precompute_llm_graph(self, server_name: str) -> bool:
+        """Run LLM pairwise classification and save result to disk cache.
+
+        Call this once per domain as an offline preprocessing step.
+        The cached graph is loaded automatically by ``_probe_dependency_graph``
+        on subsequent runs.
+
+        Returns True if graph was computed and saved successfully.
+        """
+        from pathlib import Path
+        import json as _json
+
+        session = self.manager.create_session(seed=0)
+        try:
+            all_tools = self.manager.discover_tools(session.session_id)
+            server_tools = [
+                t for t in all_tools
+                if self.manager.registry.server_for_tool(t["name"]) == server_name
+            ]
+        finally:
+            self.manager.close_session(session.session_id)
+
+        if len(server_tools) < 2:
+            logger.warning(f"precompute_llm_graph: {server_name} has < 2 tools, skipping")
+            return False
+
+        try:
+            graph = self._classify_edges_llm(server_tools, server_name)
+            if not graph:
+                return False
+        except Exception as e:
+            logger.error(f"precompute_llm_graph failed for {server_name}: {e}")
+            return False
+
+        cache_dir = Path("data/dependency_graphs")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"{server_name}.json"
+        cache_path.write_text(_json.dumps(graph, indent=2, ensure_ascii=False))
+        logger.info(
+            f"Saved LLM dependency graph: {cache_path} "
+            f"(explicit: {sum(len(v['explicit']) for v in graph.values())}, "
+            f"implicit: {sum(len(v['implicit']) for v in graph.values())})"
+        )
+        return True
 
     def _probe_dependency_graph(self, server_name: str) -> dict:
-        """PROVE Step 1: auto-discover tool dependencies via live MCP probing.
+        """PROVE Step 1: auto-discover tool dependencies.
 
-        Executes query/list tools against a fresh session, records which entity
-        IDs appear in each tool's output, then classifies directed edges:
-          explicit: tool A's output fields match tool B's required params
-          implicit: A and B operate on the same entity type
+        Uses live MCP probing + rule-based classification (field intersection for
+        explicit edges, entity-type clustering for implicit edges). This is
+        deterministic, zero-cost, and produces valid dependency graphs for
+        chain extraction.
+
+        Optional: LLM-based pairwise classification can be precomputed offline
+        and saved to ``data/dependency_graphs/{domain}.json``. If the cache file
+        exists, it takes precedence over rule-based results (higher quality
+        implicit edge detection).
         """
+        # ── Try loading precomputed LLM graph first ──
+        cached = self._maybe_load_cached_graph(server_name)
+        if cached:
+            logger.debug(f"_probe_dependency_graph: using cached LLM graph for {server_name}")
+            self._domain_graphs[server_name] = cached
+            return cached
+
         session = self.manager.create_session(seed=0)
         try:
             all_tools = self.manager.discover_tools(session.session_id)
@@ -479,14 +778,19 @@ class TaskOrchestrator:
             self.manager.close_session(session.session_id)
             return {}
 
-        graph: dict[str, dict] = {}
-        query_outputs: dict[str, set[str]] = {}
+        if len(server_tools) < 2:
+            self.manager.close_session(session.session_id)
+            return {}
 
+        graph: dict[str, dict] = {}
+        for tool in server_tools:
+            graph[tool["name"]] = {"explicit": [], "implicit": []}
+
+        # ── Rule-based classification (primary path, instantaneous) ──
+        query_outputs: dict[str, set[str]] = {}
         try:
-            # Execute read-only query tools and capture output field names
             for tool in server_tools:
                 name = tool["name"]
-                graph[name] = {"explicit": [], "implicit": []}
                 if not _is_query_tool(name):
                     continue
                 try:
@@ -495,6 +799,7 @@ class TaskOrchestrator:
                     result = self.executor.execute(
                         session.session_id,
                         ToolCall(name, probe_args, call_id=f"probe_{name}"),
+                        domain=server_name,
                     )
                     if result.success and isinstance(result.observation, dict):
                         fields: set[str] = set()
@@ -503,7 +808,7 @@ class TaskOrchestrator:
                 except Exception as e:
                     logger.debug(f"_probe_dependency_graph: probe failed for {name}: {e}")
 
-            # Classify edges
+            # Explicit edges: A's output field names match B's required params
             for a_tool, a_fields in query_outputs.items():
                 for b_tool_info in server_tools:
                     b_name = b_tool_info["name"]
@@ -514,6 +819,8 @@ class TaskOrchestrator:
                     )
                     if a_fields & b_required:
                         graph[a_tool]["explicit"].append(b_name)
+
+            # Implicit edges: A and B operate on the same entity type
             for a_name in graph:
                 if not graph[a_name]["explicit"]:
                     a_entity = _tool_entity(a_name)
@@ -523,7 +830,192 @@ class TaskOrchestrator:
         finally:
             self.manager.close_session(session.session_id)
 
+        # ── Merge yaml pre-defined dependency_graph.edges (supplements rule-based) ──
+        _merge_yaml_dependency_edges(graph, server_name, self.suite_config)
+
         return graph
+
+    def _classify_edges_llm(
+        self,
+        server_tools: list[dict],
+        server_name: str,
+    ) -> dict | None:
+        """PROVE §3.2 Step 1: LLM-based pairwise tool relationship classification.
+
+        Sends all nC2 tool pairs to the LLM in batches, asking it to classify
+        each directed edge as explicit, implicit, or none.
+
+        Returns a graph dict with the same structure as _probe_dependency_graph,
+        or None if LLM classification fails.
+        """
+        tool_names = [t["name"] for t in server_tools]
+        n = len(tool_names)
+        if n < 2:
+            return None
+
+        # Build compact tool descriptions for the LLM
+        tool_descs: list[str] = []
+        for t in server_tools:
+            name = t["name"]
+            desc = t.get("description", "")
+            props = t.get("input_schema", {}).get("properties", {})
+            required = t.get("input_schema", {}).get("required", [])
+            param_lines = []
+            for pk, pv in props.items():
+                req_mark = "*" if pk in required else ""
+                ptype = pv.get("type", "?")
+                pdesc = pv.get("description", "")
+                param_lines.append(f"    {pk}{req_mark} ({ptype}){': ' + pdesc if pdesc else ''}")
+            params_str = "\n".join(param_lines) if param_lines else "    (none)"
+            tool_descs.append(
+                f"Tool: {name}\n"
+                f"  Description: {desc}\n"
+                f"  Parameters:\n{params_str}"
+            )
+
+        tools_text = "\n\n".join(tool_descs)
+
+        # Generate all directed pairs (A → B, A ≠ B)
+        pairs: list[tuple[str, str]] = []
+        pair_labels: list[str] = []
+        for a_name in tool_names:
+            for b_name in tool_names:
+                if a_name != b_name:
+                    pairs.append((a_name, b_name))
+                    pair_labels.append(f"{a_name} → {b_name}")
+
+        # Batch pairs to fit LLM context (~20 pairs per call)
+        BATCH_SIZE = 20
+        all_classifications: dict[str, str] = {}  # "A → B" → "explicit"|"implicit"|"none"
+
+        for batch_start in range(0, len(pairs), BATCH_SIZE):
+            batch_pairs = pairs[batch_start:batch_start + BATCH_SIZE]
+            batch_labels = pair_labels[batch_start:batch_start + BATCH_SIZE]
+
+            pairs_text = "\n".join(f"{i+1}. {label}" for i, label in enumerate(batch_labels))
+
+            system = (
+                "You are analyzing tool dependencies for an MCP server. "
+                "For each directed tool pair (A → B), classify the relationship:\n"
+                '- "explicit": tool A produces output that is a REQUIRED INPUT of tool B '
+                "(e.g., A returns an entity ID that B needs as a parameter).\n"
+                '- "implicit": tool A must execute BEFORE tool B to establish state, '
+                "but A's output is not a direct input to B.\n"
+                '- "none": no dependency — B can execute without A.\n\n'
+                "Classification rules:\n"
+                "- If A's description mentions creating/returning something that B's "
+                "required parameters reference, it is explicit.\n"
+                "- If A and B operate on the same entity type (e.g., both deal with "
+                "'orders' or 'events') but A's output isn't a required param of B, "
+                "it may be implicit.\n"
+                "- Prefer explicit over implicit when both could apply.\n"
+                "- Only mark implicit if there is a genuine state dependency."
+            )
+            user = (
+                f"## Server: {server_name}\n\n"
+                f"## Tools\n{tools_text}\n\n"
+                f"## Pairs to Classify\n{pairs_text}\n\n"
+                f"## Output Format\n"
+                f'{{"classifications": [\n'
+                f'  {{"pair": "tool_a → tool_b", "relation": "explicit"}},\n'
+                f'  {{"pair": "tool_a → tool_c", "relation": "implicit"}},\n'
+                f'  ...\n'
+                f']}}\n\n'
+                f"Output ONLY the JSON, nothing else:"
+            )
+
+            try:
+                raw = self.client.generate_chat(
+                    [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+                    temperature=0.1,
+                    max_tokens=2048,
+                )
+                import json as _json
+                data = _extract_json(raw)
+                for entry in data.get("classifications", []):
+                    pair_key = entry.get("pair", "")
+                    relation = entry.get("relation", "none")
+                    if relation in ("explicit", "implicit"):
+                        all_classifications[pair_key] = relation
+            except Exception as e:
+                logger.debug(
+                    f"_classify_edges_llm batch {batch_start // BATCH_SIZE + 1} "
+                    f"failed for {server_name}: {e}"
+                )
+                # Continue with other batches; partial results are better than none
+
+        if not all_classifications:
+            return None
+
+        # Build graph from classifications
+        graph: dict[str, dict] = {}
+        for t in server_tools:
+            graph[t["name"]] = {"explicit": [], "implicit": []}
+
+        for pair_key, relation in all_classifications.items():
+            parts = pair_key.split(" → ")
+            if len(parts) == 2:
+                a_name, b_name = parts
+                if a_name in graph and b_name in graph:
+                    if relation == "explicit":
+                        graph[a_name]["explicit"].append(b_name)
+                    elif relation == "implicit":
+                        graph[a_name]["implicit"].append(b_name)
+
+        return graph
+
+    def _extract_dependency_chains(self, server_name: str) -> list[list[str]]:
+        """PROVE §6 step 2: extract length-2 to length-5 tool chains from dependency graph.
+
+        Depth-first search through the dependency graph to find all valid tool chains.
+        """
+        graph = self._domain_graphs.get(server_name) or self._probe_dependency_graph(server_name)
+        self._domain_graphs[server_name] = graph
+        if not graph:
+            return []
+
+        chains: list[list[str]] = []
+
+        def _dfs(current: str, path: list[str], visited: set[str]):
+            if len(path) >= 5:
+                return
+            for neighbor in graph.get(current, {}).get("explicit", []):
+                if neighbor in visited:
+                    continue
+                new_path = path + [neighbor]
+                if len(new_path) >= 2:
+                    chains.append(new_path)
+                _dfs(neighbor, new_path, visited | {neighbor})
+            # Also explore implicit edges
+            for neighbor in graph.get(current, {}).get("implicit", [])[:2]:
+                if neighbor in visited:
+                    continue
+                new_path = path + [neighbor]
+                if len(new_path) >= 2:
+                    chains.append(new_path)
+                _dfs(neighbor, new_path, visited | {neighbor})
+
+        for start_node in graph:
+            _dfs(start_node, [start_node], {start_node})
+
+        # Deduplicate by sorted tuple
+        unique: list[list[str]] = []
+        seen: set[tuple] = set()
+        for c in chains:
+            key = tuple(c)
+            if key not in seen:
+                seen.add(key)
+                unique.append(c)
+
+        logger.debug(f"_extract_dependency_chains: {server_name} → {len(unique)} chains")
+        return unique
+
+    def _get_chains(self, server_name: str) -> list[list[str]]:
+        """Return cached dependency chains for *server_name*, extracting if needed."""
+        if server_name not in self._domain_chains:
+            self._domain_chains[server_name] = self._extract_dependency_chains(server_name)
+        return self._domain_chains[server_name]
 
     def _get_graph_hints(self, server_name: str) -> str:
         """Return cached dependency hints for *server_name*, probing if needed."""
@@ -562,7 +1054,7 @@ def _is_query_tool(name: str) -> bool:
     return any(w in name for w in (
         "list", "search", "get", "view", "read", "show", "find", "query",
         "lookup", "check", "browse",
-    ))
+    )) or name in ("ls", "cat", "pwd", "stat", "head", "tail")
 
 
 def _tool_entity(name: str) -> str:
@@ -586,6 +1078,46 @@ def _collect_fields(obj: Any, fields: set[str], prefix: str = "") -> None:
                 _collect_fields(v, fields, f"{full}.")
     elif isinstance(obj, list) and len(obj) > 0:
         _collect_fields(obj[0], fields, prefix)
+
+
+def _merge_yaml_dependency_edges(
+    graph: dict[str, dict],
+    server_name: str,
+    suite_config: Any,
+) -> None:
+    """Merge pre-defined dependency edges from domain yaml into *graph* (mutates in-place).
+
+    Edges are defined in configs/live_mcp/{domain}.yaml under dependency_graph.edges.
+    Each entry has source_tool, target_tool, and relation (explicit|implicit).
+    """
+    if suite_config is None:
+        return
+    for server_cfg in getattr(suite_config, "servers", []):
+        if getattr(server_cfg, "name", "") != server_name:
+            continue
+        edges = getattr(server_cfg, "dependency_graph", {}).get("edges", [])
+        if not edges:
+            return
+        n_added = 0
+        for edge in edges:
+            src = edge.get("source_tool", "")
+            tgt = edge.get("target_tool", "")
+            rel = edge.get("relation", "implicit")
+            if not src or not tgt:
+                continue
+            if src not in graph:
+                graph[src] = {"explicit": [], "implicit": []}
+            if tgt not in graph:
+                graph[tgt] = {"explicit": [], "implicit": []}
+            if tgt not in graph[src][rel]:
+                graph[src][rel].append(tgt)
+                n_added += 1
+        if n_added > 0:
+            logger.debug(
+                f"_merge_yaml_dependency_edges: {server_name} "
+                f"+{n_added} yaml-defined edges"
+            )
+        return
 
 
 def _format_graph_hints(graph: dict) -> str:

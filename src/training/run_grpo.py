@@ -64,9 +64,9 @@ def main() -> None:
 
     # ── 初始化 LambdaState（lambda_safe file-backed 共享状态） ──
     from src.oval_mcp.training.lambda_state import LambdaState, DEFAULT_STATE_PATH
-    # 每次训练从干净状态开始（除非设置 OVAL_KEEP_LAMBDA=1）
-    keep_lambda = os.environ.get("OVAL_KEEP_LAMBDA", "0") != "1"
-    if keep_lambda and os.path.exists(DEFAULT_STATE_PATH):
+    # 每次训练从干净状态开始（除非设置 OVAL_KEEP_LAMBDA=1 保留上次状态）
+    should_reset = os.environ.get("OVAL_KEEP_LAMBDA", "0") != "1"
+    if should_reset and os.path.exists(DEFAULT_STATE_PATH):
         LambdaState.reset(DEFAULT_STATE_PATH)
     lambda_state = LambdaState.load_or_default()
     lambda_state.save()

@@ -90,7 +90,7 @@ if [ "${GPU_TIER}" = "L20" ]; then
     MICRO_BATCH="${OVAL_MICRO_BATCH:-2}"
     TRAIN_BATCH_SIZE="${OVAL_TRAIN_BATCH_SIZE:-32}"
     MINI_BATCH_SIZE="${OVAL_MINI_BATCH_SIZE:-8}"
-    ROLLOUT_N="${OVAL_ROLLOUT_N:-9}"
+    ROLLOUT_N="${OVAL_ROLLOUT_N:-8}"
 elif [ "${GPU_TIER}" = "A10" ]; then
     PROMPT_LENGTH="${OVAL_PROMPT_LENGTH:-10240}"
     RESPONSE_LENGTH="${OVAL_RESPONSE_LENGTH:-4096}"
@@ -187,7 +187,7 @@ echo ""
 
 # ---- launch training ----
 CONDA_PYTHON="${CONDA_PYTHON:-python3}"
-exec "${CONDA_PYTHON}" "scripts/train_runner.py" \
+exec "${CONDA_PYTHON}" "scripts/train_grpo.py" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILE}" \
     data.max_prompt_length="${PROMPT_LENGTH}" \

@@ -105,16 +105,25 @@ class ProcessScorer:
         task: Optional[dict[str, Any]] = None,
         domain_adapter: Any = None,
     ) -> ProcessScoreResult:
-        """Compute P_process for a complete trajectory."""
+        """Compute P_process for a complete trajectory.
+
+        Bonus predicates are deduplicated across steps: each predicate
+        only contributes bonus on its FIRST satisfaction. Repeated
+        satisfaction of the same predicate yields no additional bonus.
+        Penalties are NOT deduplicated (each violation is penalized).
+        """
         result = ProcessScoreResult()
 
         tools = event_log.tool_call_events
         if not tools:
             return result
 
+        # 跨 step 去重：已满足的 bonus predicate 不再重复奖励
+        satisfied_bonuses: set[str] = set()
+
         p_sum = 0.0
         for idx, event in enumerate(tools, start=1):
-            score = self._score_step(event, idx, task, domain_adapter)
+            score = self._score_step(event, idx, task, domain_adapter, satisfied_bonuses)
             result.per_step.append(score)
             p_sum += score.p_clamped
             if score.forbidden_penalty_sum < 0:
@@ -142,12 +151,20 @@ class ProcessScorer:
         step_index: int,
         task: Optional[dict[str, Any]] = None,
         domain_adapter: Any = None,
+        satisfied_bonuses: set[str] | None = None,
     ) -> StepProcessScore:
         """Compute p_t for a single tool_call event.
 
         Uses DomainAdapter.evaluate_event() for predicate satisfaction;
         falls back to generic operation-based heuristics.
+
+        Bonus deduplication: if satisfied_bonuses is provided, only predicates
+        NOT already in the set will contribute bonus. Newly satisfied predicates
+        are added to the set (mutated in-place).
         """
+        if satisfied_bonuses is None:
+            satisfied_bonuses = set()
+
         score = StepProcessScore(step=step_index)
 
         triggered_bonus: list[str] = []
@@ -164,13 +181,22 @@ class ProcessScorer:
         if satisfied:
             for pred, bonus_key in self._PREDICATE_BONUS_MAP.items():
                 if pred in satisfied and bonus_key in self._bonus:
-                    triggered_bonus.append(bonus_key)
+                    # 去重：只有首次满足才给 bonus
+                    if bonus_key not in satisfied_bonuses:
+                        triggered_bonus.append(bonus_key)
+                        satisfied_bonuses.add(bonus_key)
         else:
             # Fallback: generic heuristics
             if event.execution_success and event.state_changed:
-                triggered_bonus.append("B_complete_required_transition")
+                bonus_key = "B_complete_required_transition"
+                if bonus_key not in satisfied_bonuses:
+                    triggered_bonus.append(bonus_key)
+                    satisfied_bonuses.add(bonus_key)
             if event.execution_success and event.operation == "query":
-                triggered_bonus.append("B_resolve_required_entity")
+                bonus_key = "B_resolve_required_entity"
+                if bonus_key not in satisfied_bonuses:
+                    triggered_bonus.append(bonus_key)
+                    satisfied_bonuses.add(bonus_key)
 
         # ── penalty detection (schema / execution — orthogonal to predicates) ──
         if not event.schema_valid:

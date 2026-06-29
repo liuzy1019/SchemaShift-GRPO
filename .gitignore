@@ -38,7 +38,6 @@ data/live_mcp/traces/
 !data/.gitkeep
 !data/README.md
 !data/toolace/processed/stats.json
-!data/experiments/
 
 # 实验结果
 experiments/results/*
@@ -86,3 +85,24 @@ pytest_output.txt
 
 # 配图
 docs/figures/
+
+# Data experiments (generated results, not source)
+data/experiments/*
+!data/experiments/.gitkeep
+
+# Reference papers (large binary PDFs)
+reference/
+
+# Generated/extracted documentation content (large, derivative)
+docs/agentworld_text.txt
+docs/qwen_agentworld.pdf
+
+# Review documents (temporary/ad-hoc)
+REVIEW.md
+
+# Diagnostic/temporary test scripts
+production_smoke_test.py
+
+# Agent instruction files (not code)
+AGENTS.md
+CLAUDE.md

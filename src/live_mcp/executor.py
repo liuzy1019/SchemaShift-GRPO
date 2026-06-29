@@ -23,8 +23,16 @@ class LiveMCPExecutor:
         self.schema_registry = schema_registry
         self.timeout_s = timeout_s
 
-    def execute(self, session_id: str, tool_call: ToolCall) -> ToolExecutionResult:
+    def execute(self, session_id: str, tool_call: ToolCall, blocked_tools: set[str] | None = None, domain: str | None = None) -> ToolExecutionResult:
         started = time.monotonic()
+        if blocked_tools and tool_call.name in blocked_tools:
+            return self._result(
+                tool_call, tool_call.name, session_id, started,
+                False,
+                {"error": f"Tool '{tool_call.name}' is not available for this task"},
+                errors.UNKNOWN_TOOL, "tool blocked (missing function)",
+                False, False,
+            )
         canonical = self.schema_registry.canonical_name(tool_call.name)
         schema = self.schema_registry.get_schema(tool_call.name)
         if schema is None:
@@ -59,7 +67,7 @@ class LiveMCPExecutor:
                 False,
                 False,
             )
-        server_name = self.schema_registry.server_for_tool(tool_call.name, tool_call.arguments)
+        server_name = self.schema_registry.server_for_tool(tool_call.name, tool_call.arguments, domain=domain)
         if server_name is None:
             return self._result(
                 tool_call,
@@ -109,6 +117,8 @@ class LiveMCPExecutor:
         session_id: str,
         tool_calls: list[ToolCall],
         mode: str = "sequential",
+        blocked_tools: set[str] | None = None,
+        domain: str | None = None,
     ) -> list[ToolExecutionResult]:
         if mode != "sequential":
             return [
@@ -127,7 +137,7 @@ class LiveMCPExecutor:
                 )
                 for call in tool_calls
             ]
-        return [self.execute(session_id, call) for call in tool_calls]
+        return [self.execute(session_id, call, blocked_tools=blocked_tools, domain=domain) for call in tool_calls]
 
     def _result(
         self,

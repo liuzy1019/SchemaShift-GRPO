@@ -318,6 +318,11 @@ class AuditWrapper:
             operation=normalized.get("operation", "terminal"),
             target_type="",
             target_id="",
+            # P1-4: terminal events emit a valid trajectory step — mark as
+            # successful so reward components (R_validity / R_coverage 中
+            # 终止谓词) 不会被当成执行失败。
+            execution_success=True,
+            schema_valid=True,
         )
 
     def _get_state_safe(self, session_id: str) -> dict[str, Any] | None:

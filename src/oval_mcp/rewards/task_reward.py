@@ -136,11 +136,21 @@ class TaskReward:
         result.r_validity = self.w["w_struct"] * r_structural + self.w["w_exec"] * r_execution
 
         # 2. R_coverage: completed outcome predicates / total
-        total_preds = len(task.get("outcome_assertions", [])) or 1
-        completed = self._count_completed_predicates(event_log, task, domain_adapter)
+        # P0-2: Combine outcome_assertions (operation-level) with
+        # success_criteria (state-level). Both must be satisfied for full
+        # coverage; the denominator is the union count so that adding
+        # state criteria does not artificially deflate scores when only
+        # ops are required.
+        outcome_count = len(task.get("outcome_assertions", []))
+        criteria_list = task.get("success_criteria", []) or []
+        criteria_count = len(criteria_list)
+        total_preds = max(outcome_count + criteria_count, 1)
+        completed_ops = self._count_completed_predicates(event_log, task, domain_adapter)
+        completed_state = self._count_completed_state_criteria(event_log, criteria_list)
+        completed = completed_ops + completed_state
         result.completed_predicates = completed
         result.total_predicates = total_preds
-        result.r_coverage = completed / total_preds if total_preds > 0 else 0.0
+        result.r_coverage = min(1.0, completed / total_preds) if total_preds > 0 else 0.0
 
         # Check identity violation → R_coverage = 0
         if self._has_identity_violation(event_log, task):
@@ -203,6 +213,101 @@ class TaskReward:
             return 0.0
         success = sum(1 for e in tool_events if e.execution_success)
         return success / len(tool_events)
+
+    def _count_completed_state_criteria(
+        self,
+        event_log: EventLog,
+        criteria: list[dict],
+    ) -> int:
+        """P0-2: Verify state-level success_criteria against the trajectory.
+
+        Each criterion is a dict like:
+            {"type": "state_equals", "server": <domain>, "path": <dotted>, "value": <expected>}
+            {"type": "state_exists", "server": <domain>, "path": <dotted>}
+            {"type": "file_exists", "server": <domain>, "path": <dotted>}
+            {"type": "cart_not_empty", "server": <domain>}
+            {"type": "email_count_gte", "server": <domain>, "value": <int>}
+            {"type": "missing_function", ...}                # checked elsewhere
+
+        We approximate the post-trajectory state from the LAST tool_call
+        event whose observation is a dict (the executor returns the
+        post-call state snapshot). When no observation is available we
+        fall back to checking that any tool_call with operation matching
+        the criterion path exists; safer than always returning 0.
+
+        Returns the number of criteria that hold true.
+        """
+        if not criteria:
+            return 0
+
+        # Build a best-effort "final state" view from the latest event observation
+        # whose schema is a dict.
+        final_state: dict[str, Any] | None = None
+        for ev in reversed(event_log.events):
+            obs = getattr(ev, "observation", None)
+            if isinstance(obs, dict) and obs:
+                final_state = obs
+                break
+
+        # Build set of ids that the trajectory created/updated/deleted, so
+        # state_exists / state_equals can be approximated even without a
+        # final-state snapshot.
+        seen_ids: set[str] = set()
+        for ev in event_log.events:
+            if getattr(ev, "target_id", ""):
+                seen_ids.add(ev.target_id)
+            for cid in getattr(ev, "created_ids", []) or []:
+                seen_ids.add(cid)
+
+        completed = 0
+        for c in criteria:
+            if not isinstance(c, dict):
+                continue
+            ctype = c.get("type", "")
+            path = c.get("path", "")
+            if ctype == "missing_function":
+                # Handled by allowed_terminal_actions, not here
+                continue
+            if ctype == "state_exists":
+                if not path:
+                    continue
+                # path is dotted: e.g. "events.evt_001"
+                target = path.rsplit(".", 1)[-1]
+                if target in seen_ids or self._lookup_state(final_state, path) is not None:
+                    completed += 1
+            elif ctype == "state_equals":
+                value = c.get("value")
+                actual = self._lookup_state(final_state, path)
+                if actual is not None and str(actual) == str(value):
+                    completed += 1
+            elif ctype == "file_exists":
+                if self._lookup_state(final_state, path) is not None:
+                    completed += 1
+            elif ctype == "cart_not_empty":
+                cart = self._lookup_state(final_state, "cart") if final_state else None
+                if cart:
+                    completed += 1
+            elif ctype == "email_count_gte":
+                emails = self._lookup_state(final_state, "emails") if final_state else None
+                if isinstance(emails, dict) and len(emails) >= int(c.get("value", 0)):
+                    completed += 1
+            else:
+                # Unknown criterion type — skip rather than penalise
+                continue
+        return completed
+
+    @staticmethod
+    def _lookup_state(state: dict | None, path: str) -> Any:
+        """Walk a dotted path through a state dict; return None if missing."""
+        if not state or not isinstance(state, dict) or not path:
+            return None
+        cur: Any = state
+        for part in path.split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                return None
+        return cur
 
     def _count_completed_predicates(
         self,
@@ -352,8 +457,8 @@ class TaskReward:
         if not event_log.events:
             return False
         last = event_log.events[-1]
-        valid_terminals = {"final_answer", "ask_clarification", "report_error"}
-        return last.action_type in valid_terminals
+        allowed = task.get("allowed_terminal_actions", ["final_answer", "ask_clarification", "report_error"])
+        return last.action_type in allowed
 
 
 __all__ = ["TaskReward", "TaskRewardResult", "DEFAULT_WEIGHTS"]

@@ -99,6 +99,9 @@ class AuditEvent:
             "schema_valid": self.schema_valid,
             "state_changed": self.state_changed,
             "error_message": self.error_message,
+            "tool_arguments": self.tool_arguments,
+            "observation": self.observation,
+            "error_type": self.error_type,
             "latency_ms": self.latency_ms,
             "provenance": self.provenance,
         }

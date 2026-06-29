@@ -46,6 +46,7 @@ class OracleCall:
     tool_name: str
     arguments: dict[str, Any]
     save_as: str = ""
+    action: str = "tool_call"  # "tool_call" | "clarification" | "final_answer" | "report_error"
 
 
 @dataclass

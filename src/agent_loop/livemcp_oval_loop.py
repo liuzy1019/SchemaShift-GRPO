@@ -223,6 +223,12 @@ class LiveMCPOvalLoop(AgentLoopBase):
             session_seed = int(session_seed)
         session_id = ctx.create_session(seed=session_seed)
 
+        # ── missing_function: blocked tools ──
+        hidden_tools = extra_info.get("hidden_tools", [])
+        if isinstance(hidden_tools, str):
+            hidden_tools = [t.strip() for t in hidden_tools.split(",") if t.strip()]
+        blocked_tools: set[str] | None = set(hidden_tools) if hidden_tools else None
+
         if self.tokenizer is None:
             self.tokenizer = kwargs.get("tokenizer")
         if self.tokenizer is None:
@@ -261,7 +267,16 @@ class LiveMCPOvalLoop(AgentLoopBase):
             f"| required_tools={required_tools} | budget={budget}"
         )
 
-        for turn_idx in range(self.max_turns):
+        # P2-9: respect per-task budget when smaller than max_turns.
+        # budget comes from extra_info; max_turns is the loop hard cap.
+        try:
+            budget_int = int(budget)
+        except (TypeError, ValueError):
+            budget_int = self.max_turns
+        effective_max_turns = min(self.max_turns, max(1, budget_int))
+        turn_idx = -1  # so turn_idx+1 == 0 if loop never enters
+
+        for turn_idx in range(effective_max_turns):
             # 1. 模型生成
             try:
                 output = await self.server_manager.generate(
@@ -348,6 +363,7 @@ class LiveMCPOvalLoop(AgentLoopBase):
                         domain=task_domain,
                         tool_call=tool_call,
                         model_output=response_text,
+                        blocked_tools=blocked_tools,
                     )
                     audit_events.append(event.to_dict())
 

@@ -27,7 +27,11 @@ class OracleValidator:
         executor: LiveMCPExecutor,
         seed: int,
         check_state: bool = True,
+        domain: str | None = None,
     ) -> OracleValidationResult:
+        # Extract domain from task if not explicitly provided
+        if domain is None and hasattr(task, "target_servers") and task.target_servers:
+            domain = task.target_servers[0]
         session = manager.create_session(seed=seed)
         manager.discover_tools(session.session_id)
         results: list[ToolExecutionResult] = []
@@ -36,6 +40,7 @@ class OracleValidator:
                 result = executor.execute(
                     session.session_id,
                     ToolCall(call.tool_name, dict(call.arguments), call_id=f"oracle_{idx}"),
+                    domain=domain,
                 )
                 results.append(result)
                 if not result.success:

@@ -101,6 +101,7 @@ class OvalMCPWorkerContext:
         domain: str,
         tool_call: ToolCall,
         model_output: str = "",
+        blocked_tools: set[str] | None = None,
     ) -> tuple[AuditEvent, ToolExecutionResult]:
         """执行一次 tool_call 并产生审计事件。
 
@@ -118,8 +119,8 @@ class OvalMCPWorkerContext:
         except Exception:
             pass
 
-        # Execute via LiveMCPExecutor
-        exec_result = self.executor.execute(session_id, tool_call)
+        # Execute via LiveMCPExecutor — pass blocked_tools for missing_function tasks, domain for cross-domain disambiguation
+        exec_result = self.executor.execute(session_id, tool_call, blocked_tools=blocked_tools, domain=domain)
 
         # Capture post-state AFTER execution
         post_state = None

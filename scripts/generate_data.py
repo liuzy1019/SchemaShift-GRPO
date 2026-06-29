@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Task generation for GRPO training via two-phase planner.
+"""Task generation for GRPO training via PROVE-style state-machine teacher.
 
-Phase 1: LLM plans user_query + tool sequence (names only, ~200 tokens).
-Phase 2: Execution records oracle trace against live MCP session.
+The teacher uses LLM-in-the-loop at every turn: the LLM sees the full domain
+context (tools, live state, execution history) and decides the next action
+(tool_call with real arguments, or terminal). The resulting oracle trace is
+built by actual execution against live MCP servers.
 
-Supports two deployment modes:
+Deployment modes:
   1. Local transformers:  --model models/Qwen3-8B
   2. vLLM server:         --model Qwen3-8B --api-base http://localhost:8000/v1
 
-Data distribution:
-  complete=60%    : user query contains all information
-  missing=20%     : user query omits one critical parameter
-  minimal=20%     : user query is very brief, model must infer
-
-Robustness knobs (applied post-generation on a subset):
-  - distractor tools (3-8 irrelevant tools injected)
-  - missing function (one required tool hidden)
+PROVE-aligned defaults:
+  - Difficulty mix: complete=60%, missing=20%, minimal=20%
+  - Irrelevance ratio: 5%
+  - Distractor rate: 30% (injects 3-8 irrelevant tools)
+  - Missing function rate: 20% (hides one required tool)
+  - Enum stripping: 30% per domain
+  - Jaccard dedup threshold: 0.70
+  - Turn-decay schedule: chain_len-based (min~2, max~6 with perturbations)
+  - Personas: 10 role templates, reference dates: 10 anchors
+  - Recovery: explicit retry_same / retry_alt / give_up states
 """
 
 from __future__ import annotations
@@ -61,7 +65,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Suite config path")
     p.add_argument("--irrelevance-ratio", type=float, default=0.05,
                     help="Fraction of tasks that require report_error (0 to disable)")
-    p.add_argument("--distractor-rate", type=float, default=0.40,
+    p.add_argument("--distractor-rate", type=float, default=0.30,
                     help="Probability of injecting distractor tools (0 to disable)")
     p.add_argument("--missing-function-rate", type=float, default=0.20,
                     help="Probability of hiding a required tool (0 to disable)")
@@ -80,6 +84,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def generate_data(args: argparse.Namespace):
     """Generate GRPO training data with LLM teacher."""
     from src.live_mcp.api import LiveMCPBranch
+
+    # ── Validate parameters ──
+    if args.count < 1:
+        raise ValueError(f"--count must be >= 1, got {args.count}")
+    if args.val_count < 0:
+        raise ValueError(f"--val-count must be >= 0, got {args.val_count}")
+    for name, val in [("irrelevance_ratio", args.irrelevance_ratio),
+                       ("distractor_rate", args.distractor_rate),
+                       ("missing_function_rate", args.missing_function_rate)]:
+        if not (0.0 <= val <= 1.0):
+            raise ValueError(f"--{name} must be in [0.0, 1.0], got {val}")
+    if Path(args.output).resolve() == Path(args.val_output).resolve():
+        raise ValueError(
+            f"--output and --val-output point to the same file: {args.output}"
+        )
 
     # 如果指定了 --log-file，添加文件 sink 确保实时可见
     if args.log_file:
@@ -135,6 +154,11 @@ def generate_data(args: argparse.Namespace):
 
     df_train = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
     df_val = pd.DataFrame(val_rows) if val_rows else pd.DataFrame()
+
+    # Ensure output parent directories exist
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.val_output).parent.mkdir(parents=True, exist_ok=True)
+
     df_train.to_parquet(Path(args.output), index=False)
     df_val.to_parquet(Path(args.val_output), index=False)
 
@@ -206,7 +230,38 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
             scenario_type = task_type or "normal"
             perturbation_level = task.difficulty
 
-        group_id = f"group_{domain}_{len(rows) // 4}"
+        # 每个 task 独立一组：verl repeat(N) 后同一 prompt 的 N 个 rollout
+        # 自然形成一个 group，回归标准 GRPO per-prompt 对比语义
+        group_id = task.task_id
+
+        # Serialize oracle program calls (with real arguments) for reward matching
+        oracle_calls_serialized = []
+        if task.oracle_program and task.oracle_program.calls:
+            for oc in task.oracle_program.calls:
+                oracle_calls_serialized.append({
+                    "tool_name": oc.tool_name,
+                    "arguments": dict(oc.arguments) if oc.arguments else {},
+                    # P0-3: 保留 action 字段。澄清任务是 action="clarification"，
+                    # 丢失后会被 reward 当成普通 tool_call，导致模型输出
+                    # ask_clarification 时无法匹配。
+                    "action": getattr(oc, "action", "tool_call"),
+                })
+
+        success_criteria = (
+            list(task.oracle_program.success_criteria)
+            if task.oracle_program and task.oracle_program.success_criteria
+            else task.success_criteria if hasattr(task, "success_criteria") else []
+        )
+
+        # P0-1 fix: success_criteria is a list[dict] whose 'value' field holds
+        # mixed types (str status, numeric balance, etc.). Storing the raw list
+        # in a Parquet dict column makes pyarrow infer a single value type and
+        # crash with ArrowInvalid ("Could not convert 'paid' with type str:
+        # tried to convert to double"). Serialize to JSON string for safe
+        # round-trip; reward side parses it back via json.loads.
+        success_criteria_json = json.dumps(
+            success_criteria, ensure_ascii=False, default=str
+        )
 
         extra_info = {
             "task_id": task.task_id,
@@ -222,6 +277,9 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
             "has_distractors": has_distractors,
             "has_missing_function": has_missing_func,
             "generation_method": task.metadata.get("generation_method", "task_planner"),
+            "oracle_calls": oracle_calls_serialized,
+            "success_criteria": success_criteria_json,
+            "hidden_tools": list(task.hidden_tools) if task.hidden_tools else [],
         }
 
         row = {
@@ -229,7 +287,12 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
             "data_source": "live_mcp_state_machine",
             "reward_model": {
                 "style": "rule",
-                "ground_truth": {"task_id": task.task_id},
+                "ground_truth": {
+                    "task_id": task.task_id,
+                    "oracle_calls": oracle_calls_serialized,
+                    "success_criteria": success_criteria_json,
+                    "required_tools": task.required_tools,
+                },
             },
             "extra_info": extra_info,
             "uid": extra_info["uid"],

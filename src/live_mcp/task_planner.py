@@ -115,6 +115,68 @@ DIFFICULTY_DESCRIPTIONS: dict[str, str] = {
     ),
 }
 
+# ═══════════════════════════════════════════════════════════════════════
+# Persona templates & reference dates (PROVE §4 diversity injection)
+# ═══════════════════════════════════════════════════════════════════════
+
+_PERSONA_TEMPLATES: list[str] = [
+    "a busy team lead with back-to-back meetings",
+    "a freelancer managing multiple clients",
+    "a graduate student organizing a research project",
+    "a small business owner handling daily operations",
+    "a project manager coordinating a remote team",
+    "an executive assistant preparing for a board meeting",
+    "a software engineer debugging a production issue",
+    "a marketing manager running a campaign",
+    "a data analyst preparing a weekly report",
+    "a customer support agent resolving tickets",
+]
+
+_REFERENCE_DATES: list[str] = [
+    "Thursday, January 15, 2026",
+    "Sunday, March 8, 2026",
+    "Saturday, June 20, 2026",
+    "Wednesday, September 16, 2026",
+    "Thursday, November 12, 2026",
+    "Tuesday, February 3, 2026",
+    "Sunday, April 26, 2026",
+    "Thursday, July 30, 2026",
+    "Tuesday, October 13, 2026",
+    "Saturday, December 5, 2026",
+]
+
+# ═══════════════════════════════════════════════════════════════════════
+# Turn-decay schedule (PROVE §6: min_turns=2, max_turns=3 per chain)
+# ═══════════════════════════════════════════════════════════════════════
+
+class ContinuationPolicy:
+    """PROVE-style turn-decay schedule for deciding when to end a conversation.
+
+    The target turn count depends on chain length:
+      chain_len=2 → 2-3 turns
+      chain_len=3 → 3-4 turns
+      chain_len=4 → 4-5 turns
+      chain_len=5 → 5-6 turns
+
+    Perturbations (intermittent errors, pagination) may add 1-2 extra turns.
+    """
+
+    @staticmethod
+    def target_turns(chain_length: int, rng: random.Random) -> int:
+        """Return target turn count for a given chain length (PROVE: 2-3 range)."""
+        base = chain_length + 1  # query_turn + N tool_calls + final_answer
+        jitter = rng.randint(-1, 1)
+        return max(2, min(base + jitter, chain_length + 2))
+
+    @staticmethod
+    def should_continue(turn: int, target: int, last_action_success: bool, tool_calls_done: int) -> bool:
+        """Decide whether the conversation should continue.
+
+        Returns False if turn limit reached."""
+        if turn >= target:
+            return False
+        return True
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # TaskPlanner — LLM-in-the-loop state machine
@@ -137,11 +199,11 @@ class TaskPlanner:
     understanding of real state values, not from heuristic inference.
     """
 
-    def __init__(self, client: object, domain: str):
+    def __init__(self, client: object, domain: str, seed: int = 0):
         self.client = client
         self.domain = domain
         self.domain_desc = DOMAIN_DESCRIPTIONS.get(domain, "")
-        self._strip_enums = random.Random().random() < 0.30  # per-task, aligns with PROVE
+        self._strip_enums = random.Random(seed).random() < 0.30  # per-task seed, aligns with PROVE
 
     # ── Step 1: generate user query ──
 
@@ -152,34 +214,59 @@ class TaskPlanner:
         difficulty: str,
         rng: random.Random,
         dep_hints: str = "",
+        persona: str = "",
+        reference_date: str = "",
+        chain_seed: list[str] | None = None,
     ) -> str:
-        """LLM generates a natural-language user query grounded in live state."""
+        """LLM generates a natural-language user query grounded in live state.
+
+        PROVE §4: injects persona (character role) and reference_date (temporal anchor)
+        to increase query diversity. chain_seed constrains tools to a dependency chain.
+        """
         difficulty_desc = DIFFICULTY_DESCRIPTIONS.get(
             difficulty, DIFFICULTY_DESCRIPTIONS["complete"]
         )
         tools_text = _format_tools(tool_schemas, strip_enums=self._strip_enums)
-        state_text = _format_state(grounded_state)
+        state_text = _format_state_compact(grounded_state, max_entities=20)
+
+        # Persona & date context
+        persona_block = ""
+        if persona:
+            persona_block = f"\n## Persona\nYou are generating a query from the perspective of: {persona}.\n"
+        date_block = ""
+        if reference_date:
+            date_block = f"\n## Reference Date\nToday is {reference_date}. Use relative dates when appropriate.\n"
+
+        # Chain constraint
+        chain_block = ""
+        if chain_seed and len(chain_seed) >= 2:
+            chain_block = (
+                f"\n## Constraint\nYour query must require these tools IN ORDER:\n"
+                f"{' → '.join(chain_seed)}\n"
+                f"The task should naturally flow through this tool chain.\n"
+            )
 
         system = (
             "You are generating training data for AI tool-use agents. "
-            "Your job is to write a realistic user query."
+            "Your job is to write a realistic user query that references SPECIFIC entity IDs."
         )
         user = f"""## Domain
 {self.domain_desc}
 
 ## Available Tools
 {tools_text}
-
-{dep_hints}
-
+{persona_block}{date_block}{dep_hints}{chain_block}
 ## Current State (Real Entities — use these exact IDs and values)
 {state_text}
 
 ## Task
 Write ONE natural language user query ({difficulty} difficulty). {difficulty_desc}
 
+CRITICAL: Your query MUST include the EXACT entity IDs from the Current State
+(e.g., "update event evt_003", "cancel order ord_042", "transfer $500 from acc_01 to acc_02").
+Without entity IDs, the agent cannot act. Extract the IDs from the state above.
+
 The query should sound like a real person asking for help.
-Use EXACT IDs and values from the Current State above.
 
 ## Output Format
 {{"user_query": "<the query>"}}
@@ -213,26 +300,45 @@ Output ONLY the JSON, nothing else:
         execution_history: list[dict[str, Any]],
         attempt: int = 0,
         dep_hints: str = "",
+        difficulty: str = "complete",
     ) -> ActionPlan:
         """LLM decides the next action given full context.
 
         Called at every turn.  The LLM sees the complete execution history
         and current state, so its decisions are grounded in real values.
+
+        For 'missing' difficulty tasks, ask_clarification is expected on the
+        first turn (the query deliberately omits a parameter), so the
+        first-turn enforcement is relaxed.
         """
         tools_text = _format_tools(tool_schemas, strip_enums=self._strip_enums)
         history_text = _format_history(execution_history)
 
-        # First-turn guidance: prevent LLM from answering without tools
+        # First-turn guidance: prevent LLM from answering without tools.
+        # Exception: 'missing' difficulty tasks omit a parameter on purpose,
+        # so ask_clarification is the correct first action.
+        # Also allow lookups (list/search/get) as legitimate first steps.
         if not execution_history:
-            first_turn_hint = (
-                "\nIMPORTANT: This is your FIRST turn. You MUST call a tool before answering.\n"
-                "Do NOT use final_answer - you have not checked any data yet.\n"
-                "Look at the user task, choose the most relevant tool, and call it with appropriate arguments.\n"
-            )
-            default_action = "tool_call"
+            if difficulty == "missing":
+                first_turn_hint = (
+                    "\nIMPORTANT: This task has a MISSING parameter. "
+                    "You may need to ask_clarification before calling a tool.\n"
+                )
+                default_action = "ask_clarification"
+            else:
+                first_turn_hint = (
+                    "\nIMPORTANT: This is your FIRST turn. You should use tools to complete the task.\n"
+                    "Do NOT use final_answer or report_error before calling any tools.\n"
+                    "If the task lacks entity IDs, use list/search/get tools to look them up.\n"
+                    "If essential information is missing and cannot be found via tools, use ask_clarification.\n"
+                )
+                default_action = "ask_clarification"
+            # Block final_answer/report_error on first turn, but allow tool_call and ask_clarification
+            blocked_first = ("final_answer", "report_error")
         else:
             first_turn_hint = ""
             default_action = "final_answer"
+            blocked_first = ()
 
         system = (
             "You are controlling tools to complete a user task. "
@@ -278,16 +384,30 @@ Output ONLY the JSON, nothing else:
                 )
                 data = _extract_json(raw)
                 action = data.get("action", default_action)
-                # On first turn, reject non-tool_call actions — LLM must use tools
-                if not execution_history and action != "tool_call":
+
+                # On first turn, reject blocked action types (only final_answer/report_error)
+                if not execution_history and action in blocked_first:
                     logger.debug(
-                        f"decide_action first turn rejected '{action}' for {self.domain}, "
-                        f"retrying (attempt {_retry + 1}/3)"
+                        f"decide_action first turn rejected '{action}' for {self.domain} "
+                        f"(difficulty={difficulty}), retrying (attempt {_retry + 1}/3). LLM raw: {raw[:120]}..."
                     )
                     continue
+
+                # Validate: tool_call MUST have a non-empty tool_name
+                if action == "tool_call":
+                    tool_name = data.get("tool_name", "").strip()
+                    if not tool_name:
+                        logger.debug(
+                            f"decide_action got tool_call with empty tool_name for {self.domain}, "
+                            f"retrying (attempt {_retry + 1}/3). LLM raw: {raw[:120]}..."
+                        )
+                        continue
+                else:
+                    tool_name = ""
+
                 return ActionPlan(
                     action=action,
-                    tool_name=data.get("tool_name", ""),
+                    tool_name=tool_name,
                     arguments=data.get("arguments", {}),
                     text=data.get("text", data.get("reason", data.get("question", ""))),
                 )
@@ -302,9 +422,77 @@ Output ONLY the JSON, nothing else:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Execution perturbations (PROVE-style robustness)
-# ═══════════════════════════════════════════════════════════════════════
+    # ── Recovery module (PROVE §6 step 5a: explicit retry states) ──
+
+    def decide_recovery(
+        self,
+        last_tool_name: str,
+        last_arguments: dict[str, Any],
+        error_observation: dict[str, Any],
+        tool_schemas: list[dict[str, Any]],
+        execution_history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """PROVE-style recovery decision after a failed tool call.
+
+        Returns one of:
+          - {"action": "retry_same", "corrected_args": {...}}  — retry with tweaked params
+          - {"action": "retry_alt", "tool_name": "..."}        — use alternative tool
+          - {"action": "retry", "arguments": {...}}            — plain retry (intermittent)
+          - {"action": "give_up", "reason": "..."}             — unrecoverable
+        """
+        tools_text = _format_tools(tool_schemas, strip_enums=self._strip_enums)
+        history_text = _format_history(execution_history[-4:])  # last 4 steps
+
+        # Intermittent errors → plain retry, don't ask LLM
+        if isinstance(error_observation, dict) and error_observation.get("retry"):
+            return {"action": "retry", "arguments": last_arguments}
+
+        system = (
+            "You are recovering from a failed tool call. "
+            "Decide the best recovery strategy. Output EXACTLY one JSON object."
+        )
+        user = f"""## Failed Call
+Tool: {last_tool_name}
+Arguments: {_json.dumps(last_arguments, ensure_ascii=False)}
+Error: {_json.dumps(error_observation, ensure_ascii=False, default=str)}
+
+## Available Tools
+{tools_text}
+
+## Recent History
+{history_text}
+
+## Recovery Options
+Choose ONE:
+
+- Retry with corrected parameters:
+  {{"action": "retry_same", "corrected_args": {{"<param>": <new_value>}}}}
+
+- Try an alternative tool:
+  {{"action": "retry_alt", "tool_name": "<alternative_tool>", "arguments": {{"<param>": <value>}}}}
+
+- Give up (task impossible with current tools/state):
+  {{"action": "give_up", "reason": "<why>"}}
+
+Output ONLY the JSON, nothing else:
+"""
+        try:
+            raw = self.client.generate_chat(
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": user}],
+                temperature=0.3,
+            )
+            data = _extract_json(raw)
+            action = data.get("action", "give_up")
+            if action == "retry_same":
+                return {"action": "retry_same", "corrected_args": data.get("corrected_args", last_arguments)}
+            elif action == "retry_alt":
+                return {"action": "retry_alt", "tool_name": data.get("tool_name", ""), "arguments": data.get("arguments", {})}
+            else:
+                return {"action": "give_up", "reason": data.get("reason", "recovery failed")}
+        except Exception as e:
+            logger.debug(f"decide_recovery failed for {self.domain}: {e}")
+            return {"action": "give_up", "reason": str(e)}
 
 # Domain → perturbation group mapping, per PROVE §6 step 5a
 _DOMAIN_PERTURBATION_GROUP = {
@@ -621,25 +809,183 @@ def replay_validate(
     executor: object,
     seed: int,
     domain: str,
-) -> bool:
+) -> tuple[bool, float, int, int]:
     """Replay oracle trace against a fresh session to verify it's reproducible.
 
-    Returns True if ALL calls execute successfully in the replay session.
+    PROVE §3.2 Step 5: counts only schema-level and execution errors (not
+    empty-result responses). Discards conversations with error rate > 30%.
+
+    Returns:
+        (passed, error_rate, num_errors, num_calls)
+        - passed: True if error_rate <= 0.30
+        - error_rate: fraction of calls that failed
+        - num_errors: count of schema/execution errors
+        - num_calls: total tool calls replayed
     """
     session = manager.create_session(seed=seed)
+    num_errors = 0
+    num_calls = 0
     try:
         manager.discover_tools(session.session_id)
         for idx, call in enumerate(oracle_calls):
+            # Skip clarification calls — they are not real tool executions
+            if call.action == "clarification":
+                continue
             from src.live_mcp.types import ToolCall
             result = executor.execute(
                 session.session_id,
                 ToolCall(call.tool_name, dict(call.arguments), call_id=f"replay_{idx}"),
+                domain=domain,
             )
-            if not result.success:
-                return False
-        return True
+            num_calls += 1
+            if not result.success or not result.schema_valid:
+                # Count only schema/execution errors, not empty-result responses.
+                # PROVE: "We count only schema-level and execution errors
+                # (not empty-result responses)."
+                #
+                # Schema validation failures (schema_valid=False) are ALWAYS
+                # counted as errors — the observation dict may lack an "error"
+                # key, containing only validation details.
+                if not result.schema_valid:
+                    num_errors += 1
+                    continue
+
+                obs = result.observation
+                if isinstance(obs, dict):
+                    err_msg = obs.get("error", "")
+                    # Empty results (e.g., search returned 0 items) are NOT errors
+                    empty_indicators = (
+                        "not found", "no results", "empty", "no items",
+                        "0 results", "no matches",
+                    )
+                    if err_msg and not any(ind in str(err_msg).lower() for ind in empty_indicators):
+                        num_errors += 1
+                elif isinstance(obs, str):
+                    empty_indicators = (
+                        "not found", "no results", "empty", "no items",
+                        "0 results", "no matches",
+                    )
+                    if not any(ind in obs.lower() for ind in empty_indicators):
+                        num_errors += 1
+                else:
+                    # Unknown error type — count as error
+                    num_errors += 1
+
+        error_rate = num_errors / num_calls if num_calls > 0 else 0.0
+        passed = error_rate <= 0.30
+
+        return passed, error_rate, num_errors, num_calls
     finally:
         manager.close_session(session.session_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sensitive parameter provenance check (PROVE §3.2 Step 5)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Parameter names indicative of sensitive data (PROVE: passwords, tokens, etc.)
+_SENSITIVE_PARAM_PATTERNS: tuple[str, ...] = (
+    "password", "passwd", "token", "api_key", "apikey", "secret",
+    "access_key", "private_key", "credential", "auth_token",
+    "session_token", "refresh_token", "otp",
+)
+
+# Parameter names that carry security-relevant values but are NOT inherently
+# suspicious (e.g., account numbers used in transfers). These are checked but
+# with lower severity — they should be traceable but don't fail the provenance
+# check on their own unless they appear with a sensitive param.
+_SECURITY_RELEVANT_PARAMS: tuple[str, ...] = (
+    "account_number", "account_id", "routing_number",
+)
+
+
+def provenance_check(
+    oracle_calls: list[OracleCall],
+    user_query: str,
+    execution_history: list[dict[str, Any]],
+) -> tuple[bool, list[dict[str, Any]]]:
+    """PROVE §3.2 Step 5: check that sensitive parameters are traceable.
+
+    Sensitive parameters (passwords, tokens, API keys, etc.) must appear ONLY
+    when traceable to prior user turns or tool outputs. Parameters that appear
+    "from nowhere" indicate the teacher LLM hallucinated them, which is a
+    security risk in training data.
+
+    Returns:
+        (passed, violations)
+        - passed: True if all sensitive parameters are traceable
+        - violations: list of dicts describing each violation
+          [{"param": str, "value": str, "tool": str, "reason": str}, ...]
+    """
+    violations: list[dict[str, Any]] = []
+
+    # Build corpus of traceable values from user query and prior tool outputs.
+    # P1-8 fix: previously this loaded the ENTIRE execution_history before
+    # checking the first call — the first call could "validate" against a
+    # value that only appeared in a later step's observation. Now we walk
+    # the timeline strictly: only step i-1's observation is visible when
+    # checking call i's arguments.
+    initial_traceable: list[str] = [user_query]
+
+    # Check each oracle call's arguments for sensitive params
+    traceable_values: list[str] = list(initial_traceable)
+    for idx, call in enumerate(oracle_calls):
+        for param_name, param_value in call.arguments.items():
+            param_lower = param_name.lower()
+
+            # Check if this parameter looks sensitive
+            is_sensitive = any(p in param_lower for p in _SENSITIVE_PARAM_PATTERNS)
+            is_security = any(p in param_lower for p in _SECURITY_RELEVANT_PARAMS)
+
+            if not is_sensitive and not is_security:
+                continue
+
+            # Skip empty/None values
+            if param_value is None or param_value == "":
+                continue
+
+            # For sensitive params: value MUST be traceable
+            # For security-relevant params: warn but don't fail on their own
+            param_str = str(param_value)
+            if len(param_str) < 3:
+                continue  # too short to meaningfully check
+
+            # Check if this value appears in any traceable source observed
+            # STRICTLY BEFORE this call (no future leak).
+            traceable = any(param_str in src for src in traceable_values)
+
+            if not traceable:
+                if is_sensitive:
+                    violations.append({
+                        "param": param_name,
+                        "value": param_str[:80],
+                        "tool": call.tool_name,
+                        "call_index": idx,
+                        "reason": (
+                            f"Sensitive parameter '{param_name}' value not traceable "
+                            f"to user query or prior tool outputs"
+                        ),
+                    })
+                else:
+                    # Security-relevant but not sensitive: log-only
+                    logger.debug(
+                        f"provenance_check: security-relevant param '{param_name}' "
+                        f"in {call.tool_name} call {idx} not traced — "
+                        f"non-blocking (security_relevant category)"
+                    )
+
+        # AFTER checking call idx, fold its observation into traceable_values
+        # so that subsequent calls (idx+1, idx+2, …) can reference it.
+        if idx < len(execution_history):
+            step_obs = execution_history[idx].get("observation")
+            if isinstance(step_obs, dict):
+                import json as _json
+                traceable_values.append(_json.dumps(step_obs, ensure_ascii=False, default=str))
+            elif isinstance(step_obs, str):
+                traceable_values.append(step_obs)
+
+    passed = len(violations) == 0
+    return passed, violations
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -668,12 +1014,45 @@ def _format_tools(tool_schemas: list[dict[str, Any]], strip_enums: bool = False)
     return "\n".join(lines)
 
 
-def _format_state(state: dict[str, Any]) -> str:
-    """Format grounded state compactly."""
-    try:
-        return _json.dumps(state, indent=2, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        return str(state)[:3000]
+def _format_state_compact(state: dict[str, Any], max_entities: int = 20) -> str:
+    """Format grounded state as compact entity summaries (PROVE §4 sampling context).
+
+    Instead of dumping full JSON (which can exceed teacher attention window),
+    output one line per entity with key fields only.
+    """
+    if not isinstance(state, dict) or not state:
+        return "(empty state)"
+
+    lines: list[str] = []
+    count = 0
+    for entity_type, entities in sorted(state.items()):
+        if not isinstance(entities, dict):
+            continue
+        for entity_id, entity_data in sorted(entities.items()):
+            if count >= max_entities:
+                lines.append(f"... ({sum(len(v) if isinstance(v, dict) else 0 for v in state.values())} total entities, showing first {max_entities})")
+                return "\n".join(lines)
+            if isinstance(entity_data, dict):
+                # Extract key identity fields
+                id_fields: list[str] = []
+                for fk in ("name", "title", "subject", "status", "type", "balance", "amount"):
+                    if fk in entity_data:
+                        val = entity_data[fk]
+                        if isinstance(val, str) and len(val) > 60:
+                            val = val[:57] + "..."
+                        id_fields.append(f"{fk}={val}")
+                # Also capture id-like fields
+                for fk, fv in entity_data.items():
+                    if fk.endswith("_id") or fk.endswith("_name"):
+                        id_fields.append(f"{fk}={fv}")
+                summary = ", ".join(id_fields[:5])
+                lines.append(f"  {entity_type}/{entity_id}: {summary}" if summary else f"  {entity_type}/{entity_id}")
+            else:
+                lines.append(f"  {entity_type}/{entity_id}: {entity_data}")
+            count += 1
+    if not lines:
+        return str(state)[:2000]
+    return "\n".join(lines)
 
 
 def _format_history(history: list[dict[str, Any]]) -> str:

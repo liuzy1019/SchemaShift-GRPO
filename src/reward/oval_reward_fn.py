@@ -37,7 +37,7 @@ _progress_tracker = ProgressTracker()
 _process_scorer = ProcessScorer(p_max=0.3)
 
 # ── 消融开关（环境变量控制，默认全开） ──
-_I_SHAPE = int(os.environ.get("OVAL_I_SHAPE", "1"))
+_I_SHAPE = int(os.environ.get("OVAL_I_SHAPE", "0"))
 _I_PROCESS = int(os.environ.get("OVAL_I_PROCESS", "1"))
 _LAMBDA_SHAPE = float(os.environ.get("OVAL_LAMBDA_SHAPE", "0.5"))
 _LAMBDA_PROCESS = float(os.environ.get("OVAL_LAMBDA_PROCESS", "0.3"))
@@ -106,12 +106,44 @@ def _parse_audit_events(raw: Any) -> list[AuditEvent]:
 
 
 def _build_task_dict(extra_info: dict) -> dict:
-    """从 extra_info 构建 task_dict。"""
+    """从 extra_info 构建 task_dict，优先使用 ground_truth 中的 oracle 信息。"""
+    import json as _json
+
     domain = extra_info.get("domain", "unknown")
     task_id = extra_info.get("task_id", "unknown")
     required_tools = extra_info.get("required_tools", [])
     if isinstance(required_tools, str):
         required_tools = [t.strip() for t in required_tools.split(",") if t.strip()]
+
+    # Use saved oracle calls for accurate arg matching
+    oracle_calls = extra_info.get("oracle_calls", [])
+    if not oracle_calls:
+        # Fallback: build from ground_truth if available
+        oracle_calls = []
+
+    # P0-3: Detect clarification-type oracle calls. Clarification is a
+    # terminal action, not a real tool_call — it should NOT enter
+    # required_tool_calls (otherwise the model is penalised for not
+    # calling a tool literally named "" or "ask_clarification").
+    has_clarification_oracle = any(
+        isinstance(oc, dict) and oc.get("action") == "clarification"
+        for oc in oracle_calls
+    )
+    real_oracle_calls = [
+        oc for oc in oracle_calls
+        if not (isinstance(oc, dict) and oc.get("action") == "clarification")
+    ]
+
+    if real_oracle_calls:
+        required_tool_calls = [
+            {"tool_name": oc["tool_name"], "arguments": oc.get("arguments", {})}
+            for oc in real_oracle_calls
+        ]
+    else:
+        # Fallback: empty arguments
+        required_tool_calls = [
+            {"tool_name": tn, "arguments": {}} for tn in required_tools
+        ]
 
     ot_map = {
         "list_events": "query", "create_event": "create",
@@ -126,15 +158,44 @@ def _build_task_dict(extra_info: dict) -> dict:
         assertions.append({"operation": op, "tool_name": tn})
     assertions.append({"operation": "terminal", "tool_name": ""})
 
+    # P0-1 fix: success_criteria may be a JSON string (post-Parquet
+    # roundtrip) or a list. Normalise to list[dict].
+    success_criteria_raw = extra_info.get("success_criteria", [])
+    if isinstance(success_criteria_raw, str):
+        try:
+            success_criteria = _json.loads(success_criteria_raw)
+        except _json.JSONDecodeError:
+            success_criteria = []
+    elif isinstance(success_criteria_raw, list):
+        success_criteria = success_criteria_raw
+    else:
+        success_criteria = []
+
+    # P0-3 / P1-5: scenario-aware terminal action whitelist.
+    scenario_type = extra_info.get("scenario_type", "")
+    has_missing_func = bool(extra_info.get("has_missing_function"))
+    if has_missing_func or scenario_type == "missing_function":
+        # Required tool was hidden → only correct response is report_error
+        allowed_terminal = ["report_error"]
+    elif scenario_type == "irrelevant":
+        # Query unrelated to any available tool → only correct response is report_error
+        allowed_terminal = ["report_error"]
+    elif has_clarification_oracle:
+        # Oracle solved this with ask_clarification → it is the only
+        # correct terminal action.
+        allowed_terminal = ["ask_clarification"]
+    else:
+        # Normal task: model should give a final_answer
+        allowed_terminal = ["final_answer"]
+
     return {
         "task_id": task_id,
-        "required_tool_calls": [
-            {"tool_name": tn, "arguments": {}} for tn in required_tools
-        ],
+        "required_tool_calls": required_tool_calls,
         "identity_policy": "preserve" if domain == "calendar" else "create_new",
         "budget": extra_info.get("budget", 8),
         "outcome_assertions": assertions,
-        "allowed_terminal_actions": ["final_answer", "report_error"],
+        "allowed_terminal_actions": allowed_terminal,
+        "success_criteria": success_criteria,
     }
 
 
@@ -182,6 +243,12 @@ def compute_score(
         dict with "score" key (float) + scalar diagnostic keys.
     """
     extra_info = extra_info or {}
+
+    # Merge ground_truth data (e.g., oracle_calls, success_criteria) into extra_info
+    if isinstance(ground_truth, dict):
+        for key in ("oracle_calls", "success_criteria", "required_tools"):
+            if key not in extra_info and key in ground_truth:
+                extra_info[key] = ground_truth[key]
 
     # ── 解析 audit_events ──
     audit_raw = extra_info.get("audit_events", [])

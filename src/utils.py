@@ -82,12 +82,30 @@ def extract_json(text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-    # Try to find JSON object boundaries (greedy)
+    # Try to find JSON object boundaries (greedy) and progressively
+    # peel off trailing junk so we tolerate common LLM mistakes such as a
+    # spurious closing brace at the end (e.g.,
+    #   {"action": "tool_call", "arguments": {"k": "v"}}}
+    # ).
     brace_match = re.search(r"\{.*\}", text, re.DOTALL)
     if brace_match:
+        candidate = brace_match.group(0)
+        # Try as-is first
         try:
-            return json.loads(brace_match.group(0))
+            return json.loads(candidate)
         except json.JSONDecodeError:
             pass
+        # Iteratively trim trailing characters until parse succeeds or we
+        # run out of '}' to drop. Cap iterations to avoid pathological inputs.
+        for _ in range(8):
+            if not candidate.endswith("}"):
+                break
+            candidate = candidate[:-1].rstrip()
+            if not candidate.endswith("}"):
+                break
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
 
     raise ValueError(f"Could not extract valid JSON from: {text[:200]}...")

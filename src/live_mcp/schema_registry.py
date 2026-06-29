@@ -58,13 +58,18 @@ class SchemaRegistry:
         keys = self._matching_keys(tool_name)
         return self._schemas.get(keys[0]) if keys else None
 
-    def server_for_tool(self, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
-        """Return server name for a tool. Disambiguates by argument validation if needed."""
+    def server_for_tool(self, tool_name: str, arguments: dict[str, Any] | None = None, domain: str | None = None) -> str | None:
+        """Return server name for a tool. Disambiguates by argument validation or domain hint if needed."""
         keys = self._matching_keys(tool_name)
         if not keys:
             return None
         if len(keys) == 1:
             return self._server_from_key(keys[0])
+        # Domain hint: if caller knows the domain, use it to disambiguate
+        if domain:
+            for key in keys:
+                if self._server_from_key(key) == domain:
+                    return domain
         # Multiple matches — try to disambiguate by validating arguments
         if arguments:
             for key in keys:
