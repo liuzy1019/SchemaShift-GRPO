@@ -154,6 +154,103 @@ def _parse_audit_events(raw: Any) -> list[AuditEvent]:
     return events
 
 
+def _infer_operation(tool_name: str) -> str:
+    """Infer CRUD operation from tool name using naming conventions.
+
+    Covers all 109+ tool names across 10 domains without static enumeration.
+    """
+    if not tool_name:
+        return "query"
+
+    tn = tool_name.lower()
+
+    # ── Explicit exceptions (non-standard naming) ──
+    _exceptions = {
+        # filesystem commands
+        "cat": "query", "cd": "query", "pwd": "query", "ls": "query",
+        "stat": "query", "file_info": "query",
+        "wc": "query", "head": "query", "tail": "query", "grep": "query",
+        "df": "query", "du": "query", "tree": "query", "find": "query",
+        "diff": "query", "readlink": "query", "xxd": "query",
+        "md5sum": "query", "sha256sum": "query", "uniq": "query",
+        "sort": "query", "split": "query", "join": "query",
+        "cut": "query", "awk": "query",
+        "touch": "create", "mkdir": "create",
+        "cp": "create", "tar_create": "create", "zip": "create",
+        "mv": "update", "sed": "update", "chmod": "update",
+        "chown": "update", "symlink": "update", "truncate": "update",
+        "rm": "delete", "unzip": "update",
+        # semantic ops
+        "convert_lead": "update", "transition_issue": "update",
+        "move_to_thread": "update", "schedule_transfer": "update",
+        "transfer": "update", "wire_transfer": "update",
+        "pay_invoice": "update", "refund_invoice": "create",
+        "dispute_invoice": "update", "cancel_payment": "delete",
+        "freeze_account": "update", "unfreeze_account": "update",
+        "verify_account": "update",
+        "time_track": "create", "reorder": "create",
+        "mark_read": "update", "mark_unread": "update",
+        "apply_coupon": "update", "apply_loan": "update",
+        "rate_order": "update", "track_order": "query",
+        "track_rider": "query", "contact_support": "create",
+        "export_calendar": "query", "set_reminder": "create",
+        "set_milestone": "update", "get_history": "query",
+        "get_statement": "query", "get_recurring_info": "query",
+        "get_exchange_rate": "query", "get_working_hours": "query",
+        "get_user_status": "query", "get_menu": "query",
+        "get_popular_items": "query", "get_recommendations": "query",
+        "get_return_status": "query", "get_reviews": "query",
+        "get_time_report": "query",
+        "bill_pay": "update", "deposit": "create", "withdraw": "delete",
+        "cancel_transfer": "delete", "cancel_order": "delete",
+        "return_order": "delete", "clear_cart": "delete",
+        "complete_task": "update", "add_note": "create",
+        "add_review": "create", "add_watcher": "create",
+        "remove_watcher": "delete",
+        "create_task": "create", "list_tasks": "query",
+        "create_filter": "create", "list_filters": "query",
+        "list_categories": "query", "list_webhooks": "query",
+        "delete_webhook": "delete", "delete_contact": "delete",
+        "update_contact": "update", "update_order_status": "update",
+        "send_dm": "create", "change_timezone": "update",
+    }
+    if tn in _exceptions:
+        return _exceptions[tn]
+
+    # ── Pattern-based inference ──
+    _create_prefix = (
+        "create_", "add_", "send_", "new_", "generate_", "register_",
+        "forward_", "reply_",
+    )
+    _update_prefix = (
+        "update_", "modify_", "change_", "edit_", "set_", "upload_",
+        "rename_", "move_", "react_", "respond_", "assign_", "comment_",
+        "schedule_",
+    )
+    _delete_prefix = (
+        "delete_", "remove_", "cancel_", "archive_", "destroy_", "clear_",
+    )
+    _query_prefix = (
+        "get_", "list_", "search_", "check_", "lookup_", "view_", "read_",
+        "fetch_", "find_", "compare_", "show_", "count_", "calc_",
+    )
+
+    for p in _create_prefix:
+        if tn.startswith(p):
+            return "create"
+    for p in _delete_prefix:
+        if tn.startswith(p):
+            return "delete"
+    for p in _update_prefix:
+        if tn.startswith(p):
+            return "update"
+    for p in _query_prefix:
+        if tn.startswith(p):
+            return "query"
+
+    return "query"  # safe default
+
+
 def _build_task_dict(extra_info: dict) -> dict:
     """从 extra_info 构建 task_dict，优先使用 ground_truth 中的 oracle 信息。"""
     import json as _json
@@ -182,40 +279,69 @@ def _build_task_dict(extra_info: dict) -> dict:
     if not isinstance(oracle_calls, list):
         oracle_calls = []
 
-    # P0-3: Detect clarification-type oracle calls. Clarification is a
-    # terminal action, not a real tool_call — it should NOT enter
-    # required_tool_calls (otherwise the model is penalised for not
-    # calling a tool literally named "" or "ask_clarification").
-    has_clarification_oracle = any(
-        isinstance(oc, dict) and oc.get("action") == "clarification"
-        for oc in oracle_calls
+    # P0-3 / P4b CRITICAL: Detect clarification ONLY for the LAST oracle call.
+    # In a multi-turn conversation, a clarification in round 0 followed by
+    # successful tool calls in round 1 means the task resolves to final_answer,
+    # not ask_clarification.  Only if the last oracle action is "clarification"
+    # does the task truly end with ask_clarification.
+    last_oracle_is_clarification = (
+        oracle_calls
+        and isinstance(oracle_calls[-1], dict)
+        and oracle_calls[-1].get("action") == "clarification"
     )
     real_oracle_calls = [
         oc for oc in oracle_calls
         if not (isinstance(oc, dict) and oc.get("action") == "clarification")
     ]
 
-    if real_oracle_calls:
+    # P4a CRITICAL: missing_function / irrelevant tasks MUST NOT have
+    # required_tool_calls — the model should abstain (report_error), not
+    # call any tools.  Even when required_tools still lists tool names
+    # (from generation-time planning), the training contract demands
+    # zero tool calls.
+    scenario_type = extra_info.get("scenario_type", "")
+    has_missing_func = bool(extra_info.get("has_missing_function"))
+    is_abstain_task = has_missing_func or scenario_type in ("missing_function", "irrelevant")
+
+    if is_abstain_task:
+        required_tool_calls = []
+    elif last_oracle_is_clarification and not real_oracle_calls:
+        # P1-edge: Last round is pure clarification (no tool calls).
+        # The model should output ask_clarification, NOT call tools.
+        # Do NOT fallback to required_tools.
+        required_tool_calls = []
+    elif real_oracle_calls:
+        # P3a CRITICAL: Derive required_tool_calls from oracle_calls, NOT
+        # from the required_tools field.  required_tools comes from the
+        # generation-time plan and may differ from what the teacher LLM
+        # actually called (e.g. plan says {A, B} but teacher only called {A}).
+        # Using required_tools → tool-name mismatch in R_name/R_coverage.
         required_tool_calls = [
             {"tool_name": oc["tool_name"], "arguments": oc.get("arguments", {})}
             for oc in real_oracle_calls
         ]
     else:
-        # Fallback: empty arguments
+        # Fallback — no oracle and not an abstain task (shouldn't happen in
+        # practice, but keep as safety net).
         required_tool_calls = [
             {"tool_name": tn, "arguments": {}} for tn in required_tools
         ]
 
-    ot_map = {
-        "list_events": "query", "create_event": "create",
-        "update_event": "update", "delete_event": "delete",
-        "search_products": "query", "add_to_cart": "update",
-        "remove_from_cart": "update", "checkout": "create",
-        "get_order": "query",
-    }
+    # P3a: Build outcome_assertions from the tools that actually appear in
+    # oracle_calls (or required_tool_calls for abstain tasks), NOT from the
+    # original required_tools field which may include tools the teacher never
+    # called.
+    tool_names_for_assertions = (
+        required_tools if is_abstain_task
+        else sorted(set(oc["tool_name"] for oc in real_oracle_calls)) if real_oracle_calls
+        else []
+        # P1-edge: when clarification-only, real_oracle_calls is empty.
+        # Use empty list — the only expected "operation" is "terminal".
+    )
+    # Use naming-pattern inference instead of static ot_map (covers 109+ tools).
     assertions: list[dict] = []
-    for tn in required_tools:
-        op = ot_map.get(tn, "query")
+    for tn in tool_names_for_assertions:
+        op = _infer_operation(tn)
         assertions.append({"operation": op, "tool_name": tn})
     assertions.append({"operation": "terminal", "tool_name": ""})
 
@@ -232,18 +358,15 @@ def _build_task_dict(extra_info: dict) -> dict:
     else:
         success_criteria = []
 
-    # P0-3 / P1-5: scenario-aware terminal action whitelist.
-    scenario_type = extra_info.get("scenario_type", "")
-    has_missing_func = bool(extra_info.get("has_missing_function"))
-    if has_missing_func or scenario_type == "missing_function":
+    # P0-3 / P1-5 / P4b: scenario-aware terminal action whitelist.
+    if is_abstain_task:
         # Required tool was hidden → only correct response is report_error
         allowed_terminal = ["report_error"]
-    elif scenario_type == "irrelevant":
-        # Query unrelated to any available tool → only correct response is report_error
-        allowed_terminal = ["report_error"]
-    elif has_clarification_oracle:
-        # Oracle solved this with ask_clarification → it is the only
-        # correct terminal action.
+    elif last_oracle_is_clarification:
+        # The LAST oracle action is clarification → the task truly resolves
+        # with ask_clarification.  (Clarifications appearing earlier in the
+        # oracle history do NOT lock the terminal — they were already
+        # resolved by subsequent tool calls.)
         allowed_terminal = ["ask_clarification"]
     else:
         # Normal task: model should give a final_answer

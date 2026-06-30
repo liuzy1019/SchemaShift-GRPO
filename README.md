@@ -5,11 +5,26 @@
 PROVE-style state-machine teacher + live MCP execution + event-sourced reward + stratified advantage，训练模型在 10 个 domain / 188 个工具上进行多步工具调用。
 
 **当前方案：**
-- **数据生成**：PROVE state-machine (LLM-in-the-loop, Qwen3-32B-Instruct) → `scripts/generate_data.py` → parquet
+- **数据生成**：PROVE state-machine (LLM-in-the-loop, Qwen3-32B) → `scripts/generate_data.py` → parquet
 - **Policy 模型**：Qwen3-4B
 - **奖励**：`J = R_task + I_shape·λ_shape·F_gamma + I_process·λ_process·P_process − λ_safe·C_safety`
 - **Advantage**：2D 分层 (perturbation_level × scenario_type) + LATA + 饱和跳过
 - **硬件**：支持多 tier 自适应 (L20 / A100 / A10 / Hopper / T4)，详见 `scripts/gpu_config.sh`
+
+### PROVE 对齐状态（2026-06-30 smoke30c 审计通过）
+
+6 条不变性全部通过对抗性审查（35/35，10 domain 全覆盖）：
+
+| 不变性 | 检测项 | 结果 |
+|--------|--------|------|
+| L1 | prompt tool_call ≡ extra_info.oracle_calls（语义一致） | ✅ 0/35 |
+| L2 | visible_tools + hidden_tools = domain tools（工具完整性） | ✅ 代码审查通过 |
+| L3 | scenario_type 正确反映扰动类型 | ✅ 代码审查通过 |
+| L4 | oracle chain ≤ 5（硬上限） | ✅ 0/35 |
+| L5 | tool_result 数量 = tool_call 数量（严格对齐） | ✅ 0/35 |
+| L6 | missing_function 的 oracle_calls 为空 | ✅ 0/35 |
+
+Chain 分布: min=0 max=5 avg=2.0；轮次: 1轮 5 / 2轮 16 / 3轮 14。
 
 ---
 
@@ -21,8 +36,7 @@ PROVE-style state-machine teacher + live MCP execution + event-sourced reward + 
 │   ├── generate_data.sh             # 统一生成脚本（自动检测模型大小+GPU拓扑+并行策略）
 │   ├── train_grpo.py                # GRPO 训练 Python 入口 (Hydra)
 │   ├── train_grpo.sh                # GRPO 训练 Shell 入口（PyTorch Lightning 风格配置）
-│   ├── gpu_config.sh                # GPU 拓扑自动检测（共享库）
-│   └── adv_review.py                # 对抗审查脚本
+│   └── gpu_config.sh                # GPU 拓扑自动检测（共享库）
 │
 ├── src/
 │   ├── live_mcp/                    # MCP 环境 + 数据生成
@@ -103,15 +117,6 @@ PROVE-style state-machine teacher + live MCP execution + event-sourced reward + 
 │       ├── shopping.yaml            #   Commerce: shopping
 │       └── team_chat.yaml           #   Social: team_chat
 │
-├── tests/                           # 测试（smoke + 组件 + 对抗审查 + 集成）
-│   ├── test_production_smoke.py     #   管线端到端烟雾测试
-│   ├── test_adversarial_pipeline.py #   对抗式审查
-│   ├── test_live_mcp_10_domains.py  #   10 domain 连通性测试
-│   ├── test_stratified_advantage.py #   StratAdv 测试
-│   ├── test_grpo_framework_e2e.py   #   GRPO 框架端到端测试
-│   ├── live_mcp/                    #   live_mcp 组件测试
-│   └── ...                          #   更多组件/集成测试
-│
 ├── data/                            # 训练数据 + 实验记录（parquet gitignored）
 │   ├── train.parquet                # GRPO 训练数据
 │   ├── val.parquet                  # GRPO 验证数据
@@ -145,7 +150,7 @@ bash scripts/generate_data.sh --model models/Qwen/Qwen3-8B --domain calendar --c
 
 # 直接调用 Python CLI（高级用户）
 python scripts/generate_data.py \
-    --model Qwen3-32B-Instruct \
+    --model Qwen3-32B \
     --api-base http://localhost:8000/v1 \
     --count 500 --val-count 100
 ```

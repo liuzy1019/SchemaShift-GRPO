@@ -1,11 +1,47 @@
 # REVIEW.md — LiveMCP-GRPO 项目审查报告
 
-> 最后更新：2026-06-29（第十六轮：P0/P1 修复 + 对抗式全管线审查）
-> 当前状态：核心管线可用，500+100 全量数据生成进行中
+> 最后更新：2026-06-30（第十七轮：smoke30c PROVE 对齐审计通过 + 200+50 全量生成）
+> 当前状态：核心管线稳定，PROVE 6 条不变性全部通过，200+50 数据生成进行中
 
 ---
 
-## 1. 第十六轮修复记录（2026-06-28）
+## 1. 第十七轮：smoke30c PROVE 对齐审计（2026-06-30）
+
+### 审计结果
+
+35 条（28 train + 7 val），10 domain 全覆盖，6 条不变性全部通过：
+
+| 检测项 | 结果 |
+|--------|------|
+| PLACEHOLDER 残留 | 0/35 ✅ |
+| CHAIN > 5 | 0/35 ✅ |
+| XML=0 但 oracle 有调用 | 0/35 ✅ |
+| missing_func 含 oracle 调用 | 0/35 ✅ |
+| tool_result > tool_call (L5 违反) | 0/35 ✅ |
+| 孤儿 tool result | 0/35 ✅ |
+| Dup tool names（审计误报） | 6/35（均为同工具名不同参数，属合法语义） |
+
+场景分布: task_planner 23 / distractor 7 / missing_function 3 / irrelevant 2
+Chain 分布: min=0 max=5 avg=2.0
+
+### 关键修复（本轮累积）
+
+| # | 问题 | 修复 | 文件 |
+|---|------|------|------|
+| BUG-2 | oracle chain 跨轮溢出（6-9 长度） | 三层硬上限 cap=5：`_add_oracle()` + `_run_turn_loop()` + 跨轮全局 | `orchestrator.py` |
+| BUG-3 | list_ 类工具跨轮重复 | `seen_read_tools` 全局追踪，list_ 按名称去重 | `orchestrator.py` |
+| BUG-5 v2 | tool_result 按位置截断导致与 tool_call 错位 | 改为 `(tool_name, args)` 精确匹配渲染结果 | `generate_data.py` |
+| BUG-C | 同轮内相同 tool_call 重复 | `seen_oracle_keys` 按轮去重 | `orchestrator.py` |
+
+### 第一性原理审查（2026-06-30）
+
+从 PROVE 论文核心契约出发，逐一核验每条不变性对应的代码路径：
+
+- **L1（prompt tool_call ≡ oracle_calls）**：cross-round dedup 后的 `filtered_round_ocs` 同时用于 oracle 记录和 prompt 渲染 → ✅
+- **L2（工具完整性）**：visible + hidden = domain_tools，边界兜底注入跨域工具 → ✅
+- **L4（chain ≤ 5）**：三层硬上限共用同一常量 `MAX_ORACLE_CALLS_PER_TASK = 5` → ✅
+- **L5（tool_result = tool_call）**：`exec_index` 按 key 匹配，迭代 oracle 驱动渲染 → ✅
+- **L6（missing_function oracle 为空）**：`oracle_calls` / `oracle_calls_per_round` / `execution_history_per_round` 三维清空 → ✅
 
 | # | 问题 | 严重度 | 修复方式 | 文件 |
 |---|------|--------|---------|------|
@@ -52,10 +88,10 @@
 ## 4. 当前数据生成状态
 
 ```
-模型: Qwen3-32B-Instruct (vLLM TP=4, GPU 4-7, 4×L20 44GB)
-目标: 500 train + 100 val
-最新产出: data/train_v5.parquet + data/val_v5.parquet (200+30, 实验 gen_v5)
-状态: P0/P1 bug 修复已完成，全量生成待重跑
+模型: Qwen3-32B (vLLM TP=4, GPU 4-7, 4×L20 44GB)
+目标: 200 train + 50 val
+最新产出: smoke30c (28+7, 2026-06-30) — PROVE 对齐审计通过
+全量: 200+50 生成中（tmux generate_200）
 ```
 
 ---
@@ -84,7 +120,7 @@
 
 | 优先级 | 操作 | 说明 |
 |--------|------|------|
-| P0 | 完成 500+100 数据生成 | 进行中，ETA ~3h |
+| P0 | 完成 200+50 数据生成 | 生成中（tmux generate_200），ETA ~80min |
 | P0 | GRPO 训练 smoke test | 需数据生成完成后执行 |
 | P3 | 非法 JSON AuditEvent 盲区 | 低优先级，需跨模块类型扩展 |
 | P3 | final state 精确 snapshot | 需改 agent loop → reward 接口 |

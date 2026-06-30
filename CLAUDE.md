@@ -18,9 +18,9 @@
 
 ## 当前状态
 
-- **模型**：Teacher Qwen3-32B-Instruct（vLLM TP=4），Policy Qwen3-4B（`models/Qwen3-4B`）
+- **模型**：Teacher Qwen3-32B（vLLM TP=4），Policy Qwen3-4B（`models/Qwen3-4B`）
 - **默认环境**：8×L20 44GB（conda env: `arl`）
-- **数据生成**：500+100 全量生成进行中，核心管线 bug 已修复（P0/P1 全部闭环）
+- **数据生成**：✅ smoke30c PROVE 对齐审计通过（6 条不变性全覆盖），200+50 全量生成中
 - **GRPO 训练**：待数据生成完成后执行 smoke test
 - **SFT cold-start**：已清除
 
@@ -88,14 +88,8 @@ bash scripts/generate_data.sh --model models/Qwen/Qwen3-8B --domain calendar --c
 # OVAL GRPO 训练
 bash scripts/train_grpo.sh
 
-# 单元测试
-conda run -n arl python -m pytest tests/
-
-# 管线端到端烟雾测试
-conda run -n arl python tests/test_production_smoke.py
-
 # 轻量检查
-conda run -n arl python -m compileall src scripts tests
+conda run -n arl python -m compileall src scripts
 git diff --check
 ```
 
@@ -110,12 +104,6 @@ git diff --check
 代码改动优先跑：
 
 ```bash
-conda run -n arl python -m pytest tests/
-```
-
-只能轻量检查时至少跑：
-
-```bash
-conda run -n arl python -m compileall src scripts tests
+conda run -n arl python -m compileall src scripts
 git diff --check
 ```

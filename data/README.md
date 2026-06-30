@@ -96,8 +96,8 @@ bash scripts/generate_data.sh --model models/Qwen/Qwen3-32B --count 500 --val-co
 python scripts/generate_data.py \
   --count 500 --val-count 100 \
   --domain all \
-  --model Qwen3-32B-Instruct \
-  --api-base http://localhost:8000/v1 \
+  --model Qwen3-32B \
+  --api-base http://localhost:8001/v1 \
   --seed 42 \
   --output data/train.parquet \
   --val-output data/val.parquet
@@ -116,8 +116,8 @@ bash scripts/generate_data.sh --model models/Qwen/Qwen3-8B --domain calendar --c
 python scripts/generate_data.py \
   --experiment-tag prove_v1 \
   --count 500 --val-count 100 \
-  --model Qwen3-32B-Instruct \
-  --api-base http://localhost:8000/v1
+  --model Qwen3-32B \
+  --api-base http://localhost:8001/v1
 ```
 
 ---
@@ -134,8 +134,8 @@ python scripts/generate_data.py \
 ```json
 {
   "run_id": "2026-06-29_prove_v2",
-  "command": "python scripts/generate_data.py --count 500 --val-count 100 --model Qwen3-32B-Instruct --api-base http://localhost:8000/v1 --experiment-tag prove_v2",
-  "model": "Qwen3-32B-Instruct",
+  "command": "python scripts/generate_data.py --count 500 --val-count 100 --model Qwen3-32B --api-base http://localhost:8001/v1 --experiment-tag prove_v2",
+  "model": "Qwen3-32B",
   "domain": "all",
   "count": 500,
   "val_count": 100,

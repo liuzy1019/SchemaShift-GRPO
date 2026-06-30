@@ -898,7 +898,7 @@ def derive_success_criteria(
                 entity = final_val[nk]
                 if isinstance(entity, dict):
                     for ek in ("status", "stage", "type", "state"):
-                        if ek in entity:
+                        if ek in entity and entity[ek] is not None:
                             criteria.append({
                                 "type": "state_equals", "server": domain,
                                 "path": f"{key}.{nk}.{ek}", "value": entity[ek],
@@ -915,7 +915,7 @@ def derive_success_criteria(
                 fe = final_val[ck]
                 if isinstance(ie, dict) and isinstance(fe, dict):
                     for fk in fe:
-                        if fk in ie and ie[fk] != fe[fk]:
+                        if fk in ie and ie[fk] != fe[fk] and fe[fk] is not None:
                             criteria.append({
                                 "type": "state_equals", "server": domain,
                                 "path": f"{key}.{ck}.{fk}", "value": fe[fk],
@@ -925,9 +925,14 @@ def derive_success_criteria(
     tool_names = [c.tool_name for c in oracle_calls]
     criteria.extend(_domain_criteria(tool_names, initial_state, final_state, domain))
 
-    # Fallback: at minimum verify the domain state exists
-    if not criteria:
-        criteria.append({"type": "state_exists", "server": domain, "path": ""})
+    # P3b FIX: Removed the empty-path fallback below.
+    # Previously: if not criteria: criteria.append({"type": "state_exists",
+    # "server": domain, "path": ""})
+    # This inserted a criterion that task_reward.py skips (if not path: continue),
+    # making it a no-op that consumed a criteria slot and silently lowered
+    # r_coverage.  When no criteria can be derived, keep the list empty —
+    # r_coverage denominator uses max(outcome_count + criteria_count, 1), so
+    # an empty criteria list degrades gracefully to outcome-only coverage.
 
     return criteria
 

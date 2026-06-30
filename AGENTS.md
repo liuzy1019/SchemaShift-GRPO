@@ -111,7 +111,7 @@ Conventional Commits：`<type>: <subject>`
 
 ## 当前环境事实
 
-- Teacher 模型：Qwen3-32B-Instruct（vLLM TP=4，GPU 4-7，4×L20 44GB）
+- Teacher 模型：Qwen3-32B（vLLM TP=4，GPU 4-7，4×L20 44GB）
 - Policy 模型：Qwen3-4B（`models/Qwen3-4B`）
 - OVAL GRPO 是主训练路线（`bash scripts/train_grpo.sh`）
 - 数据生成管线 P0/P1 bug 全部修复，500+100 全量生成进行中

@@ -36,7 +36,7 @@ class TaskOrchestrator:
     4. Robustness knobs applied post-generation
 
     Usage:
-        client = LLMClient(mode="openai", model_path="Qwen3-32B-Instruct", api_base="...")
+        client = LLMClient(mode="openai", model_path="Qwen3-32B", api_base="...")
         orch = TaskOrchestrator(suite_config, manager, executor, client)
         tasks = orch.generate_many("all", count=100, seed=42)
     """

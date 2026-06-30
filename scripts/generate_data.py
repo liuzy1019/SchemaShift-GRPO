@@ -155,6 +155,49 @@ def generate_data(args: argparse.Namespace):
     df_train = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
     df_val = pd.DataFrame(val_rows) if val_rows else pd.DataFrame()
 
+    # ── Train/val semantic dedup ──
+    # UIDs are already unique because train and val use different seed ranges,
+    # but the teacher LLM can produce semantically equivalent tasks (same domain
+    # + same oracle tool sequence) across the two generate_many calls.  Filter
+    # val rows whose oracle signature already appears in train.
+    if len(df_train) > 0 and len(df_val) > 0:
+        def _oracle_sig(row):
+            ei = row["extra_info"]
+            domain = ei.get("domain", "")
+            oc_raw = ei.get("oracle_calls", [])
+            if isinstance(oc_raw, str):
+                oc_raw = json.loads(oc_raw)
+            tools = tuple(sorted(
+                c.get("tool_name", "") for c in oc_raw
+                if isinstance(c, dict) and c.get("action") != "clarification"
+            ))
+            return (domain, tools)
+
+        train_sigs = set()
+        for _, row in df_train.iterrows():
+            train_sigs.add(_oracle_sig(row))
+
+        keep_mask = []
+        removed = 0
+        for _, row in df_val.iterrows():
+            sig = _oracle_sig(row)
+            if sig in train_sigs:
+                removed += 1
+                keep_mask.append(False)
+            else:
+                keep_mask.append(True)
+
+        if removed > 0:
+            df_val = df_val[keep_mask].reset_index(drop=True)
+            logger.warning(
+                f"Removed {removed} val row(s) with oracle signatures "
+                f"already present in train (semantic dedup)"
+            )
+        logger.info(
+            f"Train/val dedup: {len(df_train)} train, {len(df_val)} val, "
+            f"{len(train_sigs)} unique oracle signatures"
+        )
+
     # Ensure output parent directories exist
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.val_output).parent.mkdir(parents=True, exist_ok=True)
@@ -257,13 +300,13 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
                     else:
                         # Round had no tool calls / clarifications recorded
                         # (e.g. all calls were filtered as duplicates, or the
-                        # round was a missing_function abstain).  Emit a
-                        # legal final_answer tag so the trajectory has the
-                        # canonical assistant action shape.
-                        prompt_messages.append({
-                            "role": "assistant",
-                            "content": "<final_answer>Done.</final_answer>",
-                        })
+                        # round was a missing_function abstain).  Do NOT inject
+                        # a fake <final_answer>Done.</final_answer> — this creates
+                        # noise when the user continues asking follow-ups in
+                        # subsequent rounds (the model sees "Done" followed by
+                        # "wait, that's wrong").  Skip the assistant message
+                        # entirely; the next round's user query follows directly.
+                        pass
 
                     # Append tool result messages (role: tool) — only for
                     # successful calls that match oracle entries.
@@ -358,18 +401,37 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
         # 自然形成一个 group，回归标准 GRPO per-prompt 对比语义
         group_id = task.task_id
 
-        # Serialize oracle program calls (with real arguments) for reward matching
+        # Serialize oracle program calls (with real arguments) for reward matching.
+        #
+        # P1 CRITICAL: For multi-turn tasks, the prompt already renders all
+        # oracle calls from rounds 0..N-2 as part of the conversation history.
+        # The model sees "these operations are already done".  If we put ALL
+        # rounds' oracle calls into the ground truth, reward asks the model to
+        # reproduce history that was already fed to it — misalignment.
+        #
+        # Fix: ground truth = ONLY the LAST round's oracle calls.  The model
+        # must execute what has NOT been shown yet.
         oracle_calls_serialized = []
         if task.oracle_program and task.oracle_program.calls:
-            for oc in task.oracle_program.calls:
-                oracle_calls_serialized.append({
-                    "tool_name": oc.tool_name,
-                    "arguments": dict(oc.arguments) if oc.arguments else {},
-                    # P0-3: 保留 action 字段。澄清任务是 action="clarification"，
-                    # 丢失后会被 reward 当成普通 tool_call，导致模型输出
-                    # ask_clarification 时无法匹配。
-                    "action": getattr(oc, "action", "tool_call"),
-                })
+            # Determine which calls belong to the last round.
+            oracle_per_round = getattr(task, "oracle_calls_per_round", None) or []
+            if len(conv_queries) > 1 and oracle_per_round and len(oracle_per_round) == len(conv_queries):
+                # Multi-turn: only the last round's oracle calls are ground truth
+                last_round_ocs = oracle_per_round[-1]
+                for oc in last_round_ocs:
+                    oracle_calls_serialized.append({
+                        "tool_name": oc.tool_name if hasattr(oc, "tool_name") else oc.get("tool_name", ""),
+                        "arguments": dict(oc.arguments) if hasattr(oc, "arguments") else oc.get("arguments", {}),
+                        "action": getattr(oc, "action", "tool_call") if hasattr(oc, "action") else oc.get("action", "tool_call"),
+                    })
+            else:
+                # Single-turn: all oracle calls are ground truth
+                for oc in task.oracle_program.calls:
+                    oracle_calls_serialized.append({
+                        "tool_name": oc.tool_name,
+                        "arguments": dict(oc.arguments) if oc.arguments else {},
+                        "action": getattr(oc, "action", "tool_call"),
+                    })
 
         success_criteria = (
             list(task.oracle_program.success_criteria)
