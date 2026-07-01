@@ -46,7 +46,7 @@ class OracleCall:
     tool_name: str
     arguments: dict[str, Any]
     save_as: str = ""
-    action: str = "tool_call"  # "tool_call" | "clarification" | "final_answer" | "report_error"
+    action: str = "tool_call"  # tool_call | ask_clarification | final_answer | report_error
 
 
 @dataclass
@@ -54,6 +54,7 @@ class OracleProgram:
     task_id: str
     calls: list[OracleCall]
     success_criteria: list[dict[str, Any]]
+    progress_predicates: list[dict[str, Any]] = field(default_factory=list)  # OVAL-MCP §5.4: per-step progress tracking
 
 
 @dataclass

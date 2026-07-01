@@ -37,29 +37,155 @@ reward_profile: issue_tracker_basic
 
 dependency_graph:
   edges:
+    # ── Issue discovery → detail → operations ──
     - source_tool: list_issues
       target_tool: get_issue
       relation: explicit
-      source_output_path: issue_id
+      source_output_path: issues[].issue_id
       target_argument_path: issue_id
+    - source_tool: list_issues
+      target_tool: assign_issue
+      relation: explicit
+      source_output_path: issues[].issue_id
+      target_argument_path: issue_id
+    - source_tool: list_issues
+      target_tool: transition_issue
+      relation: explicit
+      source_output_path: issues[].issue_id
+      target_argument_path: issue_id
+    - source_tool: list_issues
+      target_tool: add_to_sprint
+      relation: explicit
+      source_output_path: issues[].issue_id
+      target_argument_path: issue_id
+
+    # ── Issue detail → mutations ──
     - source_tool: get_issue
       target_tool: assign_issue
       relation: explicit
-      source_output_path: issue_id
+      source_output_path: issue.issue_id
       target_argument_path: issue_id
-    - source_tool: assign_issue
+    - source_tool: get_issue
       target_tool: transition_issue
       relation: explicit
-      source_output_path: issue_id
+      source_output_path: issue.issue_id
       target_argument_path: issue_id
+    - source_tool: get_issue
+      target_tool: comment_issue
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: get_issue
+      target_tool: update_issue
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: get_issue
+      target_tool: add_label
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: get_issue
+      target_tool: remove_label
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: get_issue
+      target_tool: add_watcher
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: get_issue
+      target_tool: remove_watcher
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: get_issue
+      target_tool: create_subtask
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: get_issue
+      target_tool: list_subtasks
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: get_issue
+      target_tool: time_track
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: get_issue
+      target_tool: set_milestone
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: get_issue
+      target_tool: add_to_sprint
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+
+    # ── Create → triage ──
+    - source_tool: create_issue
+      target_tool: assign_issue
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: create_issue
+      target_tool: add_label
+      relation: explicit
+      source_output_path: issue.issue_id
+      target_argument_path: issue_id
+    - source_tool: create_issue
+      target_tool: list_issues
+      relation: implicit
+      description: verify new issue visible
+
+    # ── Workflow transitions ──
+    - source_tool: assign_issue
+      target_tool: transition_issue
+      relation: implicit
+      description: assign then advance state
     - source_tool: transition_issue
       target_tool: comment_issue
       relation: implicit
-      description: comment after state transition
-    - source_tool: create_issue
-      target_tool: assign_issue
+      description: comment on state change
+    - source_tool: transition_issue
+      target_tool: get_issue
       relation: implicit
-      description: create then assign
+      description: verify state change persisted
+
+    # ── Sprint lifecycle ──
+    - source_tool: create_sprint
+      target_tool: add_to_sprint
+      relation: explicit
+      source_output_path: sprint.sprint_id
+      target_argument_path: sprint_id
+    - source_tool: list_sprints
+      target_tool: add_to_sprint
+      relation: explicit
+      source_output_path: sprints[].sprint_id
+      target_argument_path: sprint_id
+    - source_tool: add_to_sprint
+      target_tool: list_issues
+      relation: implicit
+      description: verify sprint assignment
+    - source_tool: add_to_sprint
+      target_tool: remove_from_sprint
+      relation: explicit
+      source_output_path: issue_id
+      target_argument_path: issue_id
+
+    # ── Time tracking ──
+    - source_tool: time_track
+      target_tool: get_time_report
+      relation: implicit
+      description: log time then view report
+    - source_tool: get_issue
+      target_tool: get_time_report
+      relation: implicit
+      description: view issue then check time spent
 
 query_templates:
   issue_tracker_assign_and_start:

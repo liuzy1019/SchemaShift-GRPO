@@ -37,28 +37,126 @@ reward_profile: banking_basic
 
 dependency_graph:
   edges:
-    - source_tool: get_account_info
-      target_tool: transfer
+    # ── Account discovery ──
+    - source_tool: list_accounts
+      target_tool: get_account_info
       relation: explicit
-      source_output_path: account_id
-      target_argument_path: from_account
+      source_output_path: accounts[].account_id
+      target_argument_path: account_id
+    - source_tool: list_accounts
+      target_tool: get_balance
+      relation: explicit
+      source_output_path: accounts[].account_id
+      target_argument_path: account_id
     - source_tool: get_account_info
       target_tool: get_balance
       relation: explicit
       source_output_path: account_id
       target_argument_path: account_id
+
+    # ── Balance check → mutations ──
     - source_tool: get_balance
       target_tool: transfer
       relation: implicit
-      description: check balance before deciding transfer amount
+      description: check balance before transfer
+    - source_tool: get_balance
+      target_tool: withdraw
+      relation: implicit
+      description: verify sufficient funds
+    - source_tool: get_balance
+      target_tool: deposit
+      relation: implicit
+      description: check balance before deposit
+    - source_tool: get_balance
+      target_tool: bill_pay
+      relation: implicit
+      description: verify funds before paying
+    - source_tool: get_balance
+      target_tool: wire_transfer
+      relation: implicit
+      description: verify funds including fee
+    - source_tool: get_balance
+      target_tool: apply_loan
+      relation: implicit
+      description: check collateral balance
+
+    # ── Identity verification ──
+    - source_tool: get_account_info
+      target_tool: verify_account
+      relation: explicit
+      source_output_path: account_id
+      target_argument_path: account_id
     - source_tool: verify_account
       target_tool: transfer
       relation: implicit
-      description: verify recipient before transfer
+      description: verify recipient identity
+    - source_tool: verify_account
+      target_tool: wire_transfer
+      relation: implicit
+      description: verify external recipient
+
+    # ── Transfer lifecycle ──
     - source_tool: transfer
       target_tool: get_history
       relation: implicit
-      description: transfer should appear in transaction history
+      description: transfer should appear in history
+    - source_tool: wire_transfer
+      target_tool: get_history
+      relation: implicit
+      description: wire should appear in history
+    - source_tool: schedule_transfer
+      target_tool: cancel_transfer
+      relation: explicit
+      source_output_path: scheduled_txn_id
+      target_argument_path: scheduled_txn_id
+    - source_tool: cancel_transfer
+      target_tool: get_history
+      relation: implicit
+      description: verify cancellation
+
+    # ── Bill pay ──
+    - source_tool: bill_pay
+      target_tool: get_history
+      relation: implicit
+      description: bill payment should appear in history
+
+    # ── Freeze cycle ──
+    - source_tool: get_account_info
+      target_tool: freeze_account
+      relation: explicit
+      source_output_path: account_id
+      target_argument_path: account_id
+    - source_tool: freeze_account
+      target_tool: unfreeze_account
+      relation: explicit
+      source_output_path: account_id
+      target_argument_path: account_id
+    - source_tool: unfreeze_account
+      target_tool: get_balance
+      relation: implicit
+      description: verify account accessible after unfreeze
+
+    # ── Loan ──
+    - source_tool: apply_loan
+      target_tool: list_accounts
+      relation: implicit
+      description: verify loan-linked account
+
+    # ── Cross-currency ──
+    - source_tool: get_exchange_rate
+      target_tool: transfer
+      relation: implicit
+      description: use exchange rate for cross-currency transfer
+    - source_tool: get_exchange_rate
+      target_tool: wire_transfer
+      relation: implicit
+      description: use exchange rate for wire
+
+    # ── History → statements ──
+    - source_tool: get_history
+      target_tool: get_statement
+      relation: implicit
+      description: drill into statement from transactions
 
 query_templates:
   banking_transfer:

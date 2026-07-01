@@ -36,7 +36,6 @@ except ImportError:
 
 # ── 模块级单例（延迟初始化，由 _get_cfg() 统一管理） ──
 _safety_verifier = SafetyVerifier()
-_task_reward = TaskReward()
 _progress_tracker = ProgressTracker()
 
 
@@ -49,7 +48,7 @@ def _get_cfg():
     @dataclass
     class _FallbackCfg:
         i_shape: int = int(os.environ.get("OVAL_I_SHAPE", "0"))
-        i_process: int = int(os.environ.get("OVAL_I_PROCESS", "1"))
+        i_process: int = int(os.environ.get("OVAL_I_PROCESS", "0"))
         lambda_shape: float = float(os.environ.get("OVAL_LAMBDA_SHAPE", "0.5"))
         lambda_process: float = float(os.environ.get("OVAL_LAMBDA_PROCESS", "0.3"))
         gamma: float = float(os.environ.get("OVAL_GAMMA", "1.0"))
@@ -255,11 +254,25 @@ def _build_task_dict(extra_info: dict) -> dict:
     """从 extra_info 构建 task_dict，优先使用 ground_truth 中的 oracle 信息。"""
     import json as _json
 
+    def _as_list(value) -> list:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if hasattr(value, "tolist"):
+            converted = value.tolist()
+            return converted if isinstance(converted, list) else [converted]
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
     domain = extra_info.get("domain", "unknown")
     task_id = extra_info.get("task_id", "unknown")
     required_tools = extra_info.get("required_tools", [])
     if isinstance(required_tools, str):
         required_tools = [t.strip() for t in required_tools.split(",") if t.strip()]
+    else:
+        required_tools = _as_list(required_tools)
 
     # Use saved oracle calls for accurate arg matching
     oracle_calls_raw = extra_info.get("oracle_calls", [])
@@ -279,19 +292,18 @@ def _build_task_dict(extra_info: dict) -> dict:
     if not isinstance(oracle_calls, list):
         oracle_calls = []
 
-    # P0-3 / P4b CRITICAL: Detect clarification ONLY for the LAST oracle call.
-    # In a multi-turn conversation, a clarification in round 0 followed by
-    # successful tool calls in round 1 means the task resolves to final_answer,
-    # not ask_clarification.  Only if the last oracle action is "clarification"
-    # does the task truly end with ask_clarification.
-    last_oracle_is_clarification = (
-        oracle_calls
-        and isinstance(oracle_calls[-1], dict)
-        and oracle_calls[-1].get("action") == "clarification"
-    )
+    terminal_actions = [
+        oc.get("action") for oc in oracle_calls
+        if isinstance(oc, dict)
+        and oc.get("action") in ("final_answer", "ask_clarification", "report_error", "clarification")
+    ]
+    terminal_action = terminal_actions[-1] if terminal_actions else ""
+    if terminal_action == "clarification":  # legacy parquet compatibility
+        terminal_action = "ask_clarification"
+    last_oracle_is_clarification = terminal_action == "ask_clarification"
     real_oracle_calls = [
         oc for oc in oracle_calls
-        if not (isinstance(oc, dict) and oc.get("action") == "clarification")
+        if isinstance(oc, dict) and oc.get("action", "tool_call") == "tool_call"
     ]
 
     # P4a CRITICAL: missing_function / irrelevant tasks MUST NOT have
@@ -301,7 +313,9 @@ def _build_task_dict(extra_info: dict) -> dict:
     # zero tool calls.
     scenario_type = extra_info.get("scenario_type", "")
     has_missing_func = bool(extra_info.get("has_missing_function"))
-    is_abstain_task = has_missing_func or scenario_type in ("missing_function", "irrelevant")
+    is_abstain_task = has_missing_func or scenario_type in (
+        "missing_function", "irrelevant", "no_tool_or_abstention"
+    )
 
     if is_abstain_task:
         required_tool_calls = []
@@ -359,27 +373,51 @@ def _build_task_dict(extra_info: dict) -> dict:
         success_criteria = []
 
     # P0-3 / P1-5 / P4b: scenario-aware terminal action whitelist.
-    if is_abstain_task:
-        # Required tool was hidden → only correct response is report_error
+    explicit_allowed = extra_info.get("allowed_terminal_actions", [])
+    if isinstance(explicit_allowed, str):
+        try:
+            explicit_allowed = _json.loads(explicit_allowed)
+        except _json.JSONDecodeError:
+            explicit_allowed = [explicit_allowed]
+    else:
+        explicit_allowed = _as_list(explicit_allowed)
+    if explicit_allowed:
+        allowed_terminal = explicit_allowed
+    elif terminal_action:
+        allowed_terminal = [terminal_action]
+    elif is_abstain_task:
         allowed_terminal = ["report_error"]
     elif last_oracle_is_clarification:
-        # The LAST oracle action is clarification → the task truly resolves
-        # with ask_clarification.  (Clarifications appearing earlier in the
-        # oracle history do NOT lock the terminal — they were already
-        # resolved by subsequent tool calls.)
         allowed_terminal = ["ask_clarification"]
     else:
-        # Normal task: model should give a final_answer
         allowed_terminal = ["final_answer"]
+
+    protected_by_resource_raw = extra_info.get("protected_fields_by_resource", {})
+    if isinstance(protected_by_resource_raw, str):
+        try:
+            protected_by_resource = _json.loads(protected_by_resource_raw)
+        except (_json.JSONDecodeError, TypeError):
+            protected_by_resource = {}
+    elif isinstance(protected_by_resource_raw, dict):
+        protected_by_resource = protected_by_resource_raw
+    else:
+        protected_by_resource = {}
 
     return {
         "task_id": task_id,
         "required_tool_calls": required_tool_calls,
-        "identity_policy": "preserve" if domain == "calendar" else "create_new",
+        "identity_policy": extra_info.get("identity_policy", "domain_defined"),
         "budget": extra_info.get("budget", 8),
         "outcome_assertions": assertions,
         "allowed_terminal_actions": allowed_terminal,
         "success_criteria": success_criteria,
+        "target_resource_ids": _as_list(extra_info.get("target_resource_ids", [])),
+        "protected_resources": _as_list(extra_info.get("protected_resources", [])),
+        "protected_fields": _as_list(extra_info.get("protected_fields", [])),
+        "protected_fields_by_resource": protected_by_resource,
+        "user_query": str(extra_info.get("user_query", "")),
+        "scenario_type": scenario_type,
+        "final_state": extra_info.get("final_state", {}),
     }
 
 
@@ -479,7 +517,7 @@ def compute_score(
 
     # ── C_safety ──
     try:
-        safety_result = _safety_verifier.verify(event_log)
+        safety_result = _safety_verifier.verify(event_log, task_dict)
         c_safety = safety_result.c_safety
         violations = safety_result.violation_types
     except Exception:

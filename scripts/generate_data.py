@@ -13,11 +13,11 @@ Deployment modes:
 PROVE-aligned defaults:
   - Difficulty mix: complete=60%, missing=20%, minimal=20%
   - Irrelevance ratio: 5%
-  - Distractor rate: 30% (injects 3-8 irrelevant tools)
+  - Distractor rate: 40% (injects 3-8 irrelevant tools)
   - Missing function rate: 20% (hides one required tool)
   - Enum stripping: 30% per domain
   - Jaccard dedup threshold: 0.70
-  - Turn-decay schedule: chain_len-based (min~2, max~6 with perturbations)
+  - Conversation rounds: 2-3 (turn-decay schedule, PROVE min_turns=2 max_turns=3)
   - Personas: 10 role templates, reference dates: 10 anchors
   - Recovery: explicit retry_same / retry_alt / give_up states
 """
@@ -65,7 +65,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Suite config path")
     p.add_argument("--irrelevance-ratio", type=float, default=0.05,
                     help="Fraction of tasks that require report_error (0 to disable)")
-    p.add_argument("--distractor-rate", type=float, default=0.30,
+    p.add_argument("--distractor-rate", type=float, default=0.40,
                     help="Probability of injecting distractor tools (0 to disable)")
     p.add_argument("--missing-function-rate", type=float, default=0.20,
                     help="Probability of hiding a required tool (0 to disable)")
@@ -125,28 +125,76 @@ def generate_data(args: argparse.Namespace):
 
     try:
         branch.start()
-        print(f"[generate_data] Generating {args.count} train tasks...", flush=True)
-        train_tasks = branch.generate_tasks_llm(
-            server_name=args.domain, count=args.count, seed=args.seed,
-            difficulty_mix=difficulty_mix, model_path=args.model,
-            api_base=args.api_base,
-            device=args.device,
-            irrelevance_ratio=args.irrelevance_ratio,
-            distractor_rate=args.distractor_rate,
-            missing_function_rate=args.missing_function_rate,
-        )
-        print(f"[generate_data] Train done: {len(train_tasks)} tasks", flush=True)
-        print(f"[generate_data] Generating {args.val_count} val tasks...", flush=True)
-        val_tasks = branch.generate_tasks_llm(
-            server_name=args.domain, count=args.val_count, seed=args.seed + 10000,
-            difficulty_mix=difficulty_mix, model_path=args.model,
-            api_base=args.api_base,
-            device=args.device,
-            irrelevance_ratio=args.irrelevance_ratio,
-            distractor_rate=args.distractor_rate,
-            missing_function_rate=args.missing_function_rate,
-        )
-        print(f"[generate_data] Val done: {len(val_tasks)} tasks", flush=True)
+        total_count = args.count + args.val_count
+        # Oversample 50% (was 10%) plus a floor — LLM generation, replay,
+        # provenance checks, dedup, and training-contract filtering all
+        # discard tasks.  Recovery loop below regenerates with different seed
+        # offsets when the first pool still falls short.
+        pool_target = total_count + max(10, total_count // 2)
+        print(f"[generate_data] Generating pool of ~{pool_target} tasks...", flush=True)
+
+        all_tasks = []
+        MAX_RECOVERY_ROUNDS = 3
+        for recovery_round in range(MAX_RECOVERY_ROUNDS):
+            round_seed = args.seed + recovery_round * 100000
+            round_target = pool_target if recovery_round == 0 else pool_target // 2
+            print(
+                f"[generate_data] Round {recovery_round + 1}/{MAX_RECOVERY_ROUNDS}: "
+                f"generating up to {round_target} tasks (seed={round_seed})...",
+                flush=True,
+            )
+            round_tasks = branch.generate_tasks_llm(
+                server_name=args.domain, count=round_target, seed=round_seed,
+                difficulty_mix=difficulty_mix, model_path=args.model,
+                api_base=args.api_base,
+                device=args.device,
+                irrelevance_ratio=args.irrelevance_ratio,
+                distractor_rate=args.distractor_rate,
+                missing_function_rate=args.missing_function_rate,
+            )
+            all_tasks.extend(round_tasks)
+            logger.info(
+                f"Round {recovery_round + 1}: got {len(round_tasks)} tasks "
+                f"(cumulative {len(all_tasks)})"
+            )
+
+            # Try to split early — if we already have enough, break out.
+            eligible = _filter_training_eligible_tasks(all_tasks)
+            if len(eligible) >= total_count:
+                try:
+                    train_tasks, val_tasks = _stratified_task_split(
+                        eligible, train_count=args.count,
+                        val_count=args.val_count, seed=args.seed,
+                    )
+                    print(
+                        f"[generate_data] Early split success: "
+                        f"{len(train_tasks)} train + {len(val_tasks)} val "
+                        f"from {len(eligible)} eligible tasks "
+                        f"(pool {len(all_tasks)})",
+                        flush=True,
+                    )
+                    all_tasks = eligible  # use filtered tasks for downstream
+                    break
+                except RuntimeError:
+                    logger.info(
+                        f"Round {recovery_round + 1}: {len(eligible)} eligible "
+                        f"tasks not enough for stratified split, generating more..."
+                    )
+        else:
+            # Exhausted recovery rounds — fall through with whatever we have.
+            eligible = _filter_training_eligible_tasks(all_tasks)
+            train_tasks, val_tasks = _stratified_task_split(
+                eligible, train_count=args.count,
+                val_count=args.val_count, seed=args.seed,
+            )
+            print(
+                f"[generate_data] Final split: {len(train_tasks)} train + "
+                f"{len(val_tasks)} val from {len(eligible)} eligible "
+                f"(pool {len(all_tasks)} after {MAX_RECOVERY_ROUNDS} rounds)",
+                flush=True,
+            )
+
+        all_tasks = eligible  # ensure downstream uses filtered tasks
         all_rows = _tasks_to_rows(train_tasks, args.seed)
         val_rows = _tasks_to_rows(val_tasks, args.seed + 10000)
     finally:
@@ -155,48 +203,7 @@ def generate_data(args: argparse.Namespace):
     df_train = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
     df_val = pd.DataFrame(val_rows) if val_rows else pd.DataFrame()
 
-    # ── Train/val semantic dedup ──
-    # UIDs are already unique because train and val use different seed ranges,
-    # but the teacher LLM can produce semantically equivalent tasks (same domain
-    # + same oracle tool sequence) across the two generate_many calls.  Filter
-    # val rows whose oracle signature already appears in train.
-    if len(df_train) > 0 and len(df_val) > 0:
-        def _oracle_sig(row):
-            ei = row["extra_info"]
-            domain = ei.get("domain", "")
-            oc_raw = ei.get("oracle_calls", [])
-            if isinstance(oc_raw, str):
-                oc_raw = json.loads(oc_raw)
-            tools = tuple(sorted(
-                c.get("tool_name", "") for c in oc_raw
-                if isinstance(c, dict) and c.get("action") != "clarification"
-            ))
-            return (domain, tools)
-
-        train_sigs = set()
-        for _, row in df_train.iterrows():
-            train_sigs.add(_oracle_sig(row))
-
-        keep_mask = []
-        removed = 0
-        for _, row in df_val.iterrows():
-            sig = _oracle_sig(row)
-            if sig in train_sigs:
-                removed += 1
-                keep_mask.append(False)
-            else:
-                keep_mask.append(True)
-
-        if removed > 0:
-            df_val = df_val[keep_mask].reset_index(drop=True)
-            logger.warning(
-                f"Removed {removed} val row(s) with oracle signatures "
-                f"already present in train (semantic dedup)"
-            )
-        logger.info(
-            f"Train/val dedup: {len(df_train)} train, {len(df_val)} val, "
-            f"{len(train_sigs)} unique oracle signatures"
-        )
+    _assert_split_integrity(df_train, df_val, args)
 
     # Ensure output parent directories exist
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -209,6 +216,528 @@ def generate_data(args: argparse.Namespace):
         _save_experiment_record(args, df_train, df_val, start_time)
 
     _print_stats(df_train, df_val, Path(args.output), Path(args.val_output), args)
+
+
+def _task_scenario(task) -> str:
+    explicit = task.metadata.get("scenario_type") if task.metadata else None
+    if explicit:
+        return str(explicit)
+    if task.task_type == "missing_function":
+        return "no_tool_or_abstention"
+    if task.task_type == "irrelevant":
+        return "no_tool_or_abstention"
+    return "normal_safe_success"
+
+
+def _identity_policy(domain: str) -> str:
+    return {
+        "calendar": "preserve",
+        "banking": "preserve",
+        "filesystem": "domain_defined",
+        "payments": "preserve",
+        "crm": "preserve",
+        "issue_tracker": "preserve",
+        "email": "append_only",
+        "team_chat": "append_only",
+        "shopping": "create_new",
+        "food_delivery": "create_new",
+    }.get(domain, "domain_defined")
+
+
+def _task_fingerprint(task) -> str:
+    """Semantic identity used before splitting, never as a deletion rule."""
+    import hashlib
+
+    domain = task.target_servers[0] if task.target_servers else ""
+    calls = []
+    for call in task.oracle_program.calls if task.oracle_program else []:
+        if getattr(call, "action", "tool_call") != "tool_call":
+            continue
+        calls.append({
+            "tool_name": call.tool_name,
+            "arguments": call.arguments or {},
+        })
+    payload = {
+        "domain": domain,
+        "scenario": _task_scenario(task),
+        "query": " ".join((task.user_prompt or "").lower().split()),
+        "calls": calls,
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _serialize_training_oracle(task) -> list[dict]:
+    """Return tool calls plus exactly one terminal action for training."""
+    raw_calls = []
+    if task.oracle_program and task.oracle_program.calls:
+        for oc in task.oracle_program.calls:
+            raw_calls.append({
+                "tool_name": oc.tool_name,
+                "arguments": dict(oc.arguments) if oc.arguments else {},
+                "action": getattr(oc, "action", "tool_call"),
+            })
+
+    terminals = [
+        call for call in raw_calls
+        if call.get("action") in ("final_answer", "ask_clarification", "report_error")
+    ]
+    if not terminals:
+        raise ValueError(f"Task {task.task_id} has no explicit terminal oracle action")
+
+    tool_calls = [
+        call for call in raw_calls
+        if call.get("action", "tool_call") == "tool_call"
+    ]
+    return tool_calls + [terminals[-1]]
+
+
+def _has_stale_explicit_year(value) -> bool:
+    import re
+
+    raw = json.dumps(value, ensure_ascii=False, default=str)
+    return bool(re.search(r"\b202[0-5][-/]", raw))
+
+
+def _task_success_criteria(task) -> list:
+    if task.oracle_program and task.oracle_program.success_criteria:
+        return list(task.oracle_program.success_criteria)
+    if hasattr(task, "success_criteria") and task.success_criteria:
+        return list(task.success_criteria)
+    return []
+
+
+def _validate_task_training_contract(task) -> None:
+    oracle_calls_serialized = _serialize_training_oracle(task)
+    if _has_stale_explicit_year(oracle_calls_serialized):
+        raise ValueError(
+            f"Task {task.task_id} oracle contains an explicit pre-2026 date"
+        )
+
+    terminal_actions = [
+        call["action"] for call in oracle_calls_serialized
+        if call.get("action") in ("final_answer", "ask_clarification", "report_error")
+    ]
+    if len(terminal_actions) != 1:
+        raise ValueError(
+            f"Task {task.task_id} has {len(terminal_actions)} terminal oracle actions"
+        )
+
+    real_required_tools = [
+        call["tool_name"] for call in oracle_calls_serialized
+        if call.get("action", "tool_call") == "tool_call"
+    ]
+    scenario_type = _task_scenario(task)
+    is_no_tool = scenario_type in (
+        "no_tool_or_abstention", "clarification_required",
+        "missing_function", "irrelevant",
+    )
+    if is_no_tool and real_required_tools:
+        raise ValueError(
+            f"No-tool task {task.task_id} unexpectedly has "
+            f"{len(real_required_tools)} tool calls"
+        )
+    if not is_no_tool and not (2 <= len(real_required_tools) <= 5):
+        raise ValueError(
+            f"Tool task {task.task_id} has oracle length "
+            f"{len(real_required_tools)}, expected 2-5"
+        )
+
+
+def _filter_training_eligible_tasks(tasks: list) -> list:
+    eligible = []
+    dropped = 0
+    for task in tasks:
+        try:
+            _validate_task_training_contract(task)
+        except ValueError as exc:
+            dropped += 1
+            logger.warning("Dropping generated task before split: {}", exc)
+            continue
+        eligible.append(task)
+    if dropped:
+        logger.warning(
+            "Dropped {} generated task(s) that violate the training contract",
+            dropped,
+        )
+    return eligible
+
+
+def _stratified_task_split(
+    tasks: list,
+    train_count: int,
+    val_count: int,
+    seed: int,
+) -> tuple[list, list]:
+    """Split one deduplicated pool by domain/scenario/difficulty.
+
+    Generating the splits independently and deleting validation rows by tool
+    signature collapsed the old validation set.  This routine assigns semantic
+    fingerprints exactly once, then reserves validation coverage across strata.
+    """
+    import random
+    from collections import defaultdict
+
+    unique = []
+    seen = set()
+    for task in tasks:
+        fp = _task_fingerprint(task)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        task.metadata["semantic_fingerprint"] = fp
+        unique.append(task)
+
+    required = train_count + val_count
+    if len(unique) < required:
+        raise RuntimeError(
+            f"Generation produced {len(unique)} unique tasks, but {required} "
+            "are required for the requested train/val split."
+        )
+
+    rng = random.Random(seed)
+
+    if val_count == 0:
+        rng.shuffle(unique)
+        return unique[:train_count], []
+
+    # A category represented once cannot appear in both disjoint splits.
+    # Drop such unsplittable outliers when the oversampled pool still has
+    # enough rows, repeating because removing one category can expose another.
+    strict_unique = list(unique)
+    strict_possible = True
+    while True:
+        domain_totals = defaultdict(int)
+        scenario_totals = defaultdict(int)
+        for task in strict_unique:
+            domain = task.target_servers[0] if task.target_servers else "unknown"
+            domain_totals[domain] += 1
+            scenario_totals[_task_scenario(task)] += 1
+        singleton_domains = {key for key, count in domain_totals.items() if count < 2}
+        singleton_scenarios = {key for key, count in scenario_totals.items() if count < 2}
+        if not singleton_domains and not singleton_scenarios:
+            break
+        filtered = [
+            task for task in strict_unique
+            if (task.target_servers[0] if task.target_servers else "unknown")
+            not in singleton_domains
+            and _task_scenario(task) not in singleton_scenarios
+        ]
+        removed = len(strict_unique) - len(filtered)
+        if len(filtered) < required:
+            strict_possible = False
+            logger.warning(
+                "Strict train/val coverage is infeasible after removing "
+                "{} singleton-category task(s): have {}, need {}. "
+                "Falling back to exact disjoint split. domains={}, scenarios={}",
+                removed,
+                len(filtered),
+                required,
+                sorted(singleton_domains),
+                sorted(singleton_scenarios),
+            )
+            break
+        logger.warning(
+            "Dropping {} unsplittable singleton-category task(s): domains={}, "
+            "scenarios={}",
+            removed,
+            sorted(singleton_domains),
+            sorted(singleton_scenarios),
+        )
+        strict_unique = filtered
+
+    if not strict_possible:
+        return _fallback_task_split(unique, train_count, val_count, rng)
+
+    def _domain(task) -> str:
+        return task.target_servers[0] if task.target_servers else "unknown"
+
+    domain_counts = defaultdict(int)
+    scenario_counts = defaultdict(int)
+    for task in strict_unique:
+        domain_counts[_domain(task)] += 1
+        scenario_counts[_task_scenario(task)] += 1
+
+    scenarios = sorted(scenario_counts)
+    domains = sorted(domain_counts)
+    if val_count < len(scenarios) or val_count < len(domains):
+        logger.warning(
+            "Validation count {} cannot cover {} scenario(s) and {} domain(s); "
+            "falling back to exact disjoint split.",
+            val_count,
+            len(scenarios),
+            len(domains),
+        )
+        return _fallback_task_split(unique, train_count, val_count, rng)
+
+    # Proportional scenario targets with a minimum of one row per scenario
+    # when feasible.  This makes val representative instead of dominated by
+    # whichever coverage buckets happen to be popped first.
+    total_available = len(strict_unique)
+    raw_targets = {
+        scenario: scenario_counts[scenario] * val_count / total_available
+        for scenario in scenarios
+    }
+    scenario_targets = {
+        scenario: min(scenario_counts[scenario] - 1, max(1, int(raw_targets[scenario])))
+        for scenario in scenarios
+    }
+    while sum(scenario_targets.values()) < val_count:
+        candidates = [
+            scenario for scenario in scenarios
+            if scenario_targets[scenario] < scenario_counts[scenario] - 1
+        ]
+        if not candidates:
+            break
+        scenario = max(
+            candidates,
+            key=lambda s: (raw_targets[s] - scenario_targets[s], scenario_counts[s], s),
+        )
+        scenario_targets[scenario] += 1
+    while sum(scenario_targets.values()) > val_count:
+        candidates = [
+            scenario for scenario in scenarios
+            if scenario_targets[scenario] > 1
+        ]
+        if not candidates:
+            break
+        scenario = min(
+            candidates,
+            key=lambda s: (raw_targets[s] - scenario_targets[s], scenario_counts[s], s),
+        )
+        scenario_targets[scenario] -= 1
+
+    remaining = list(strict_unique)
+    rng.shuffle(remaining)
+    val = []
+    val_domain_counts = defaultdict(int)
+    val_scenario_counts = defaultdict(int)
+
+    def _can_take(task) -> bool:
+        domain = _domain(task)
+        scenario = _task_scenario(task)
+        return domain_counts[domain] > 1 and scenario_counts[scenario] > 1
+
+    def _take_best(predicate, score) -> bool:
+        candidates = [task for task in remaining if predicate(task) and _can_take(task)]
+        if not candidates:
+            return False
+        task = max(candidates, key=score)
+        remaining.remove(task)
+        val.append(task)
+        domain = _domain(task)
+        scenario = _task_scenario(task)
+        domain_counts[domain] -= 1
+        scenario_counts[scenario] -= 1
+        val_domain_counts[domain] += 1
+        val_scenario_counts[scenario] += 1
+        return True
+
+    # Cover every domain, preferring scenarios that are still below their
+    # proportional validation quota.
+    for domain in domains:
+        if len(val) >= val_count:
+            break
+        _take_best(
+            lambda task, d=domain: _domain(task) == d,
+            lambda task: (
+                scenario_targets[_task_scenario(task)] - val_scenario_counts[_task_scenario(task)],
+                scenario_counts[_task_scenario(task)],
+                rng.random(),
+            ),
+        )
+
+    # Fill scenario quotas.
+    for scenario in scenarios:
+        while len(val) < val_count and val_scenario_counts[scenario] < scenario_targets[scenario]:
+            if not _take_best(
+                lambda task, s=scenario: _task_scenario(task) == s,
+                lambda task: (
+                    0 if val_domain_counts[_domain(task)] else 1,
+                    domain_counts[_domain(task)],
+                    rng.random(),
+                ),
+            ):
+                break
+
+    # Fill any remaining slots by largest scenario deficit, still reserving
+    # one train row for each domain and scenario.
+    while len(val) < val_count:
+        if not _take_best(
+            lambda task: True,
+            lambda task: (
+                scenario_targets[_task_scenario(task)] - val_scenario_counts[_task_scenario(task)],
+                0 if val_domain_counts[_domain(task)] else 1,
+                domain_counts[_domain(task)],
+                rng.random(),
+            ),
+        ):
+            break
+    if len(val) != val_count:
+        logger.warning(
+            "Strict validation allocation produced {}/{} rows; falling back "
+            "to exact disjoint split.",
+            len(val),
+            val_count,
+        )
+        return _fallback_task_split(unique, train_count, val_count, rng)
+
+    train = []
+
+    def _pop_train(predicate) -> bool:
+        for task in list(remaining):
+            if predicate(task):
+                train.append(task)
+                remaining.remove(task)
+                return True
+        return False
+
+    val_domains = {_domain(task) for task in val}
+    val_scenarios = {_task_scenario(task) for task in val}
+    for domain in sorted(val_domains):
+        if len(train) >= train_count:
+            break
+        _pop_train(lambda task, d=domain: _domain(task) == d)
+    for scenario in sorted(val_scenarios):
+        if len(train) >= train_count:
+            break
+        if any(_task_scenario(task) == scenario for task in train):
+            continue
+        _pop_train(lambda task, s=scenario: _task_scenario(task) == s)
+
+    rng.shuffle(remaining)
+    train.extend(remaining[:max(0, train_count - len(train))])
+    if len(train) != train_count:
+        logger.warning(
+            "Strict train allocation produced {}/{} rows; falling back to "
+            "exact disjoint split.",
+            len(train),
+            train_count,
+        )
+        return _fallback_task_split(unique, train_count, val_count, rng)
+    return train, val
+
+
+def _fallback_task_split(
+    tasks: list,
+    train_count: int,
+    val_count: int,
+    rng,
+) -> tuple[list, list]:
+    """Exact disjoint split for small or highly imbalanced generated pools."""
+    from collections import Counter
+
+    pool = list(tasks)
+    rng.shuffle(pool)
+    required = train_count + val_count
+    if len(pool) < required:
+        raise RuntimeError(
+            f"Cannot allocate fallback split from {len(pool)} tasks; need {required}"
+        )
+
+    def _domain(task) -> str:
+        return task.target_servers[0] if task.target_servers else "unknown"
+
+    domain_counts = Counter(_domain(task) for task in pool)
+    scenario_counts = Counter(_task_scenario(task) for task in pool)
+
+    val = []
+    remaining = list(pool)
+    for task in list(remaining):
+        if len(val) >= val_count:
+            break
+        domain = _domain(task)
+        scenario = _task_scenario(task)
+        if domain_counts[domain] <= 1 or scenario_counts[scenario] <= 1:
+            continue
+        val.append(task)
+        remaining.remove(task)
+        domain_counts[domain] -= 1
+        scenario_counts[scenario] -= 1
+
+    for task in list(remaining):
+        if len(val) >= val_count:
+            break
+        val.append(task)
+        remaining.remove(task)
+
+    train = []
+    val_domains = {_domain(task) for task in val}
+    val_scenarios = {_task_scenario(task) for task in val}
+
+    for domain in sorted(val_domains):
+        if len(train) >= train_count:
+            break
+        for task in list(remaining):
+            if _domain(task) == domain:
+                train.append(task)
+                remaining.remove(task)
+                break
+
+    for scenario in sorted(val_scenarios):
+        if len(train) >= train_count:
+            break
+        if any(_task_scenario(task) == scenario for task in train):
+            continue
+        for task in list(remaining):
+            if _task_scenario(task) == scenario:
+                train.append(task)
+                remaining.remove(task)
+                break
+
+    train.extend(remaining[:max(0, train_count - len(train))])
+    if len(train) != train_count or len(val) != val_count:
+        raise RuntimeError(
+            f"Fallback split size mismatch: train={len(train)}/{train_count}, "
+            f"val={len(val)}/{val_count}"
+        )
+    return train, val
+
+
+def _row_fingerprint(row) -> str:
+    return str(row["extra_info"].get("semantic_fingerprint", ""))
+
+
+def _assert_split_integrity(df_train, df_val, args) -> None:
+    if len(df_train) != args.count or len(df_val) != args.val_count:
+        raise RuntimeError(
+            f"Split size mismatch: train={len(df_train)}/{args.count}, "
+            f"val={len(df_val)}/{args.val_count}"
+        )
+    train_fp = {_row_fingerprint(row) for _, row in df_train.iterrows()}
+    val_fp = {_row_fingerprint(row) for _, row in df_val.iterrows()}
+    train_fp.discard("")
+    val_fp.discard("")
+    overlap = train_fp & val_fp
+    if overlap:
+        raise RuntimeError(f"Train/val semantic leakage: {len(overlap)} fingerprints")
+    if args.val_count:
+        train_domains = {row["extra_info"].get("domain") for _, row in df_train.iterrows()}
+        val_domains = {row["extra_info"].get("domain") for _, row in df_val.iterrows()}
+        if not val_domains.issubset(train_domains):
+            raise RuntimeError(
+                f"Validation domain not represented in train: train={sorted(train_domains)} "
+                f"val={sorted(val_domains)}"
+            )
+        if train_domains != val_domains:
+            logger.warning(
+                "Validation domain coverage is a subset of train: train={} val={}",
+                sorted(train_domains),
+                sorted(val_domains),
+            )
+        train_scenarios = set(df_train["scenario_type"])
+        val_scenarios = set(df_val["scenario_type"])
+        if not val_scenarios.issubset(train_scenarios):
+            raise RuntimeError(
+                f"Validation scenario not represented in train: train={sorted(train_scenarios)} "
+                f"val={sorted(val_scenarios)}"
+            )
+        if train_scenarios != val_scenarios:
+            logger.warning(
+                "Validation scenario coverage is a subset of train: train={} val={}",
+                sorted(train_scenarios),
+                sorted(val_scenarios),
+            )
 
 
 def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
@@ -228,6 +757,7 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
             continue  # Skip tasks without tool schemas
 
         tools_desc_lines = []
+        strip_enums = bool(task.metadata.get("strip_enums", False))
         for t in visible_tools:
             name = t.get("name", "")
             desc = t.get("description", "")
@@ -238,8 +768,13 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
                 req = " (required)" if pname in required else ""
                 ptype = pinfo.get("type", "any")
                 pdesc = pinfo.get("description", "")
+                enum_values = pinfo.get("enum")
+                enum_desc = (
+                    f" Allowed values: {json.dumps(enum_values, ensure_ascii=False)}."
+                    if enum_values is not None and not strip_enums else ""
+                )
                 tools_desc_lines.append(
-                    f"    - {pname} ({ptype}{req}): {pdesc}"
+                    f"    - {pname} ({ptype}{req}): {pdesc}{enum_desc}"
                 )
         tools_block = "\n".join(tools_desc_lines)
         visible_tool_names = [t.get("name", "") for t in visible_tools if t.get("name")]
@@ -252,131 +787,37 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
             f"Available tools:\n{tools_block}\n\n"
             f"Response format:\n"
             f'- To call a tool: <tool_call>{{"name": "tool_name", "arguments": {{...}}}}</tool_call>\n'
+            f"  Emit exactly ONE tool_call per assistant turn, then wait for its tool result.\n"
             f"- To give final answer: <final_answer>your answer</final_answer>\n"
             f"- To report error: <report_error>error description</report_error>\n"
-            f"- To ask clarification: <ask_clarification>your question</ask_clarification>"
+            f"- To ask clarification: <ask_clarification>your question</ask_clarification>\n"
+            f"\n"
+            f"Examples:\n"
+            f"---\n"
+            f"Example 1 (single-step query):\n"
+            f"User: what events do I have next Tuesday?\n"
+            f"Assistant: <tool_call>{{\"name\": \"search_something\", \"arguments\": {{\"keyword\": \"next Tuesday\"}}}}</tool_call>\n"
+            f"Tool result: [{{\"id\": \"evt_01\", \"title\": \"Team Standup\", \"time\": \"10:00\"}}]\n"
+            f"Assistant: <final_answer>You have one event on Tuesday: Team Standup at 10:00.</final_answer>\n"
+            f"\n"
+            f"Example 2 (multi-step with dependency):\n"
+            f"User: move $200 from my savings to checking\n"
+            f"Assistant: <tool_call>{{\"name\": \"check_balance\", \"arguments\": {{\"account\": \"savings\"}}}}</tool_call>\n"
+            f"Tool result: {{\"balance\": 500}}\n"
+            f"Assistant: <tool_call>{{\"name\": \"transfer_money\", \"arguments\": {{\"from\": \"savings\", \"to\": \"checking\", \"amount\": 200}}}}</tool_call>\n"
+            f"Tool result: {{\"status\": \"success\", \"new_balance\": 300}}\n"
+            f"Assistant: <final_answer>Transferred $200 from savings to checking. Remaining balance: $300.</final_answer>"
         )
 
-        # ── Build multi-turn prompt from conversation_queries (PROVE CONTINUATION) ──
-        # Inject oracle's actual tool_calls and execution results for all rounds
-        # except the last, so the model sees a realistic multi-turn trajectory.
-        conv_queries = getattr(task, "conversation_queries", None) or []
-        oracle_per_round = getattr(task, "oracle_calls_per_round", None) or []
-        exec_per_round = getattr(task, "execution_history_per_round", None) or []
+        # One row always starts from reset(session_seed).  Tool observations
+        # make the live rollout multi-turn; teacher calls must never be exposed
+        # in the initial prompt unless they are also replayed into the session.
+        prompt = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task.user_prompt},
+        ]
+        n_conversation_rounds = len(task.conversation_queries) or 1
 
-        if len(conv_queries) > 1 and oracle_per_round:
-            # Multi-turn with real tool-call history
-            prompt_messages = [{"role": "system", "content": system_prompt}]
-            for ri, q in enumerate(conv_queries):
-                prompt_messages.append({"role": "user", "content": q})
-                if ri < len(conv_queries) - 1:
-                    round_ocs = oracle_per_round[ri] if ri < len(oracle_per_round) else []
-                    round_exec = exec_per_round[ri] if ri < len(exec_per_round) else []
-
-                    # Build assistant message with action-specific tags.
-                    # System prompt defines: <tool_call>, <final_answer>,
-                    # <ask_clarification>, <report_error>.  sglang's
-                    # FunctionCallParser handles <tool_call> exclusively;
-                    # the other three are parsed by ActionParser during rollout.
-                    tc_parts = []
-                    for oc in round_ocs:
-                        action = getattr(oc, "action", "tool_call") if hasattr(oc, "action") else oc.get("action", "tool_call") if isinstance(oc, dict) else "tool_call"
-                        if action == "tool_call":
-                            name = oc.tool_name if hasattr(oc, "tool_name") else oc.get("tool_name", "")
-                            args = oc.arguments if hasattr(oc, "arguments") else oc.get("arguments", {})
-                            tc_json = json.dumps({"name": name, "arguments": args}, ensure_ascii=False, default=str)
-                            tc_parts.append(f"<tool_call>{tc_json}</tool_call>")
-                        elif action == "clarification":
-                            # Extract clarification question from arguments
-                            args = oc.arguments if hasattr(oc, "arguments") else oc.get("arguments", {})
-                            question = args.get("question", "") if isinstance(args, dict) else ""
-                            tc_parts.append(f"<ask_clarification>{question}</ask_clarification>")
-
-                    if tc_parts:
-                        prompt_messages.append({
-                            "role": "assistant",
-                            "content": "\n".join(tc_parts),
-                        })
-                    else:
-                        # Round had no tool calls / clarifications recorded
-                        # (e.g. all calls were filtered as duplicates, or the
-                        # round was a missing_function abstain).  Do NOT inject
-                        # a fake <final_answer>Done.</final_answer> — this creates
-                        # noise when the user continues asking follow-ups in
-                        # subsequent rounds (the model sees "Done" followed by
-                        # "wait, that's wrong").  Skip the assistant message
-                        # entirely; the next round's user query follows directly.
-                        pass
-
-                    # Append tool result messages (role: tool) — only for
-                    # successful calls that match oracle entries.
-                    # BUG-5 fix (v2): cross-round dedup and within-round dedup
-                    # filter oracle_calls but leave execution_history intact.
-                    # Simple positional truncation causes misalignment.  Match
-                    # by (tool_name, serialised_arguments) instead — only emit
-                    # results for calls whose oracle survived dedup.
-                    exec_index: dict[tuple[str, str], dict] = {}
-                    for ex in round_exec:
-                        if not isinstance(ex, dict) or not ex.get("success", True):
-                            continue  # skip failed/retry entries
-                        ekey = (
-                            ex.get("tool_name", ""),
-                            json.dumps(ex.get("arguments", {}) or {}, sort_keys=True, default=str, ensure_ascii=False),
-                        )
-                        if ekey[0] and ekey not in exec_index:
-                            exec_index[ekey] = ex
-
-                    for oc in round_ocs:
-                        action = getattr(oc, "action", "tool_call") if hasattr(oc, "action") else oc.get("action", "tool_call") if isinstance(oc, dict) else "tool_call"
-                        if action != "tool_call":
-                            continue
-                        oc_name = oc.tool_name if hasattr(oc, "tool_name") else oc.get("tool_name", "")
-                        oc_args = oc.arguments if hasattr(oc, "arguments") else oc.get("arguments", {})
-                        ockey = (
-                            oc_name,
-                            json.dumps(oc_args or {}, sort_keys=True, default=str, ensure_ascii=False),
-                        )
-                        matched = exec_index.get(ockey)
-                        if matched is None:
-                            # cross-round dedup dropped the call — no result
-                            continue
-                        obs = matched.get("observation", {})
-                        if isinstance(obs, dict):
-                            obs_text = json.dumps(obs, ensure_ascii=False, default=str)
-                        else:
-                            obs_text = str(obs)
-                        prompt_messages.append({
-                            "role": "tool",
-                            "content": obs_text,
-                        })
-
-            prompt = prompt_messages
-            has_conversation = True
-            n_conversation_rounds = len(conv_queries)
-        elif len(conv_queries) > 1:
-            # Fallback: multi-turn queries exist but no per-round oracle data
-            # (e.g., tasks generated by older code, or missing_function tasks
-            # whose per-round data was cleared).  Use minimal final_answer.
-            prompt_messages = [{"role": "system", "content": system_prompt}]
-            for qi, q in enumerate(conv_queries):
-                prompt_messages.append({"role": "user", "content": q})
-                if qi < len(conv_queries) - 1:
-                    prompt_messages.append({
-                        "role": "assistant",
-                        "content": "<final_answer>Done.</final_answer>",
-                    })
-            prompt = prompt_messages
-            has_conversation = True
-            n_conversation_rounds = len(conv_queries)
-        else:
-            prompt = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task.user_prompt},
-            ]
-            has_conversation = False
-            n_conversation_rounds = 1
-
-        task_type = task.task_type
         has_distractors = task.metadata.get("has_distractors", False)
         has_missing_func = task.metadata.get("has_missing_function", False)
 
@@ -388,56 +829,21 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
         # computation. Keep difficulty intact; expose knob status via the
         # separate scenario_type/has_* fields.
         perturbation_level = task.difficulty
-        if has_missing_func:
-            scenario_type = "missing_function"
-        elif task_type == "irrelevant":
-            scenario_type = "irrelevant"
-        elif has_distractors:
-            scenario_type = "distractor"
-        else:
-            scenario_type = task_type or "normal"
+        scenario_type = _task_scenario(task)
 
         # 每个 task 独立一组：verl repeat(N) 后同一 prompt 的 N 个 rollout
         # 自然形成一个 group，回归标准 GRPO per-prompt 对比语义
         group_id = task.task_id
 
-        # Serialize oracle program calls (with real arguments) for reward matching.
-        #
-        # P1 CRITICAL: For multi-turn tasks, the prompt already renders all
-        # oracle calls from rounds 0..N-2 as part of the conversation history.
-        # The model sees "these operations are already done".  If we put ALL
-        # rounds' oracle calls into the ground truth, reward asks the model to
-        # reproduce history that was already fed to it — misalignment.
-        #
-        # Fix: ground truth = ONLY the LAST round's oracle calls.  The model
-        # must execute what has NOT been shown yet.
-        oracle_calls_serialized = []
-        if task.oracle_program and task.oracle_program.calls:
-            # Determine which calls belong to the last round.
-            oracle_per_round = getattr(task, "oracle_calls_per_round", None) or []
-            if len(conv_queries) > 1 and oracle_per_round and len(oracle_per_round) == len(conv_queries):
-                # Multi-turn: only the last round's oracle calls are ground truth
-                last_round_ocs = oracle_per_round[-1]
-                for oc in last_round_ocs:
-                    oracle_calls_serialized.append({
-                        "tool_name": oc.tool_name if hasattr(oc, "tool_name") else oc.get("tool_name", ""),
-                        "arguments": dict(oc.arguments) if hasattr(oc, "arguments") else oc.get("arguments", {}),
-                        "action": getattr(oc, "action", "tool_call") if hasattr(oc, "action") else oc.get("action", "tool_call"),
-                    })
-            else:
-                # Single-turn: all oracle calls are ground truth
-                for oc in task.oracle_program.calls:
-                    oracle_calls_serialized.append({
-                        "tool_name": oc.tool_name,
-                        "arguments": dict(oc.arguments) if oc.arguments else {},
-                        "action": getattr(oc, "action", "tool_call"),
-                    })
+        # The prompt contains no teacher trajectory, so the complete oracle
+        # (2-5 tool calls plus one explicit terminal action) is the unresolved
+        # ground truth from reset(session_seed).  Multi-round teacher internals
+        # can include per-round terminal actions; training rows keep only the
+        # final terminal so the reward contract remains single-terminal.
+        oracle_calls_serialized = _serialize_training_oracle(task)
+        _validate_task_training_contract(task)
 
-        success_criteria = (
-            list(task.oracle_program.success_criteria)
-            if task.oracle_program and task.oracle_program.success_criteria
-            else task.success_criteria if hasattr(task, "success_criteria") else []
-        )
+        success_criteria = _task_success_criteria(task)
 
         # P0-1 fix: success_criteria is a list[dict] whose 'value' field holds
         # mixed types (str status, numeric balance, etc.). Storing the raw list
@@ -449,12 +855,39 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
             success_criteria, ensure_ascii=False, default=str
         )
 
+        terminal_actions = [
+            c["action"] for c in oracle_calls_serialized
+            if c.get("action") in ("final_answer", "ask_clarification", "report_error")
+        ]
+        if len(terminal_actions) != 1:
+            raise ValueError(
+                f"Task {task.task_id} has {len(terminal_actions)} terminal oracle actions"
+            )
+        allowed_terminal_actions = [terminal_actions[-1]]
+        real_required_tools = [
+            c["tool_name"] for c in oracle_calls_serialized
+            if c.get("action", "tool_call") == "tool_call"
+        ]
+        is_no_tool = scenario_type in (
+            "no_tool_or_abstention", "clarification_required", "missing_function", "irrelevant"
+        )
+        if is_no_tool and real_required_tools:
+            raise ValueError(
+                f"No-tool task {task.task_id} unexpectedly has {len(real_required_tools)} tool calls"
+            )
+        if not is_no_tool and not (2 <= len(real_required_tools) <= 5):
+            raise ValueError(
+                f"Tool task {task.task_id} has oracle length {len(real_required_tools)}, expected 2-5"
+            )
+
         extra_info = {
             "task_id": task.task_id,
             "domain": domain,
             "target_servers": task.target_servers,
-            "required_tools": task.required_tools,
+            "required_tools": real_required_tools,
             "session_seed": task.session_seed,
+            "initial_state_hash": task.metadata.get("initial_state_hash", ""),
+            "user_query": task.user_prompt,
             "budget": task.max_turns,
             "perturbation_level": perturbation_level,
             "scenario_type": scenario_type,
@@ -462,6 +895,20 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
             "uid": task.task_id,
             "has_distractors": has_distractors,
             "has_missing_function": has_missing_func,
+            "enum_stripped": strip_enums,
+            "identity_policy": task.metadata.get("identity_policy", _identity_policy(domain)),
+            "target_resource_ids": task.metadata.get("target_resource_ids", []),
+            "protected_resources": task.metadata.get("protected_resources", []),
+            "protected_fields": task.metadata.get("protected_fields", []),
+            # JSON string avoids Arrow's unsupported empty struct type when
+            # a split happens to contain no protected-field mappings.
+            "protected_fields_by_resource": json.dumps(
+                task.metadata.get("protected_fields_by_resource", {}),
+                ensure_ascii=False,
+                default=str,
+            ),
+            "allowed_terminal_actions": allowed_terminal_actions,
+            "semantic_fingerprint": task.metadata.get("semantic_fingerprint", ""),
             "generation_method": task.metadata.get("generation_method", "task_planner"),
             # P1-11: serialize oracle_calls to JSON string to prevent
             # pyarrow struct unification. When different oracle_calls have
@@ -486,7 +933,8 @@ def _tasks_to_rows(tasks: list, base_seed: int) -> list[dict]:
                     # Same JSON serialization as extra_info.oracle_calls
                     "oracle_calls": json.dumps(oracle_calls_serialized, ensure_ascii=False, default=str),
                     "success_criteria": success_criteria_json,
-                    "required_tools": task.required_tools,
+                    "required_tools": real_required_tools,
+                    "allowed_terminal_actions": allowed_terminal_actions,
                 },
             },
             "extra_info": extra_info,
@@ -558,9 +1006,7 @@ def _save_experiment_record(args, df_train, df_val, start_time: datetime):
 
     # result.json
     if len(df_train) > 0:
-        domain_dist = (
-            df_train["extra_info"].apply(lambda x: x.get("domain")).value_counts().to_dict()
-        )
+        domain_dist = _domain_distribution(df_train)
         scenario_dist = df_train["scenario_type"].value_counts().to_dict()
         difficulty_dist = df_train["perturbation_level"].value_counts().to_dict()
     else:
@@ -577,6 +1023,11 @@ def _save_experiment_record(args, df_train, df_val, start_time: datetime):
         "domain_distribution": domain_dist,
         "scenario_distribution": scenario_dist,
         "difficulty_distribution": difficulty_dist,
+        "empty_success_criteria": _empty_success_criteria_counts(df_train),
+        "val_scenario_distribution": (
+            df_val["scenario_type"].value_counts().to_dict()
+            if len(df_val) > 0 else {}
+        ),
         "timestamp": end_time.isoformat(),
     }
     (exp_dir / "result.json").write_text(
@@ -584,6 +1035,36 @@ def _save_experiment_record(args, df_train, df_val, start_time: datetime):
     )
 
     logger.info(f"Experiment record saved: {exp_dir}")
+
+
+def _domain_distribution(df: pd.DataFrame) -> dict:
+    if len(df) == 0:
+        return {}
+    return df["extra_info"].apply(lambda x: x.get("domain")).value_counts().to_dict()
+
+
+def _empty_success_criteria_counts(df: pd.DataFrame) -> dict:
+    if len(df) == 0:
+        return {}
+
+    counts: dict[str, int] = {}
+    for _, row in df.iterrows():
+        extra_info = row["extra_info"]
+        raw = extra_info.get("success_criteria", [])
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = []
+        else:
+            parsed = raw or []
+        if parsed:
+            continue
+        domain = extra_info.get("domain", "unknown")
+        scenario = extra_info.get("scenario_type", row.get("scenario_type", "unknown"))
+        key = f"{domain}/{scenario}"
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _print_stats(df_train, df_val, train_path, val_path, args):
@@ -598,25 +1079,29 @@ def _print_stats(df_train, df_val, train_path, val_path, args):
         print("\nWARNING: No training data generated!")
         return
 
-    # Per-domain stats
-    domains = set()
-    for _, row in df_train.iterrows():
-        domains.add(row["extra_info"]["domain"])
-    for domain in sorted(domains):
+    # Per-domain and per-scenario stats.
+    domains = sorted(_domain_distribution(df_train))
+    for domain in domains:
         domain_rows = df_train[
             df_train["extra_info"].apply(lambda x: x.get("domain") == domain)
         ]
         print(f"\n  {domain}: {len(domain_rows)} rows")
-        for stype in ["normal", "distractor", "missing_function", "irrelevant", "task_planner"]:
-            count = len(
-                domain_rows[domain_rows["scenario_type"] == stype]
-            )
-            if count > 0:
-                print(f"    {stype}: {count}")
+        scenario_counts = domain_rows["scenario_type"].value_counts().to_dict()
+        for scenario, count in sorted(scenario_counts.items()):
+            print(f"    {scenario}: {count}")
 
     # Difficulty distribution
     difficulty_dist = df_train["perturbation_level"].value_counts().to_dict()
     print(f"\n  Difficulty distribution: {difficulty_dist}")
+    print(f"  Scenario distribution: {df_train['scenario_type'].value_counts().to_dict()}")
+    if len(df_val) > 0:
+        print(f"  Val scenario distribution: {df_val['scenario_type'].value_counts().to_dict()}")
+
+    empty_criteria = _empty_success_criteria_counts(df_train)
+    if empty_criteria:
+        print("  Empty success_criteria diagnostics:")
+        for key, count in empty_criteria.items():
+            print(f"    {key}: {count}")
 
     # Sample queries (show 3)
     print("\n  Sample queries:")

@@ -144,19 +144,20 @@ class TaskReward:
         if not self._check_terminal_predicate(event_log, task):
             result.r_validity *= 0.5
 
-        # 2. R_coverage: completed outcome predicates / total
-        # P0-2: Combine outcome_assertions (operation-level) with
-        # success_criteria (state-level). Both must be satisfied for full
-        # coverage; the denominator is the union count so that adding
-        # state criteria does not artificially deflate scores when only
-        # ops are required.
-        outcome_count = len(task.get("outcome_assertions", []))
+        # 2. R_coverage: ordered required calls + terminal + state criteria.
+        # Generic predicate names cannot represent multiplicity (three query
+        # calls collapse to one "resolved_required_entity" set member), so
+        # coverage is aligned directly to the serialized oracle in dependency
+        # order, matching PROVE's definition.
         criteria_list = task.get("success_criteria", []) or []
         criteria_count = len(criteria_list)
-        total_preds = max(outcome_count + criteria_count, 1)
-        completed_ops = self._count_completed_predicates(event_log, task, domain_adapter)
-        completed_state = self._count_completed_state_criteria(event_log, criteria_list)
-        completed = completed_ops + completed_state
+        aligned_calls = self._match_required_calls_in_order(tool_events, required_tool_calls)
+        terminal_completed = 1 if self._check_terminal_predicate(event_log, task) else 0
+        total_preds = max(len(required_tool_calls) + 1 + criteria_count, 1)
+        completed_state = self._count_completed_state_criteria(
+            event_log, criteria_list, final_state=task.get("final_state")
+        )
+        completed = len(aligned_calls) + terminal_completed + completed_state
         result.completed_predicates = completed
         result.total_predicates = total_preds
         result.r_coverage = min(1.0, completed / total_preds) if total_preds > 0 else 0.0
@@ -177,7 +178,6 @@ class TaskReward:
             result.r_name = correct_calls / n_calls
 
         # 4. R_arg: argument value match for aligned calls
-        aligned_calls = self._identify_aligned_calls(tool_events, task, required_tool_calls)
         result.aligned_calls = len(aligned_calls)
         result.r_arg = self._compute_arg_score(aligned_calls)
 
@@ -228,12 +228,14 @@ class TaskReward:
         self,
         event_log: EventLog,
         criteria: list[dict],
+        final_state: dict[str, Any] | None = None,
     ) -> int:
         """P0-2: Verify state-level success_criteria against the trajectory.
 
         Each criterion is a dict like:
             {"type": "state_equals", "server": <domain>, "path": <dotted>, "value": <expected>}
             {"type": "state_exists", "server": <domain>, "path": <dotted>}
+            {"type": "state_absent", "server": <domain>, "path": <dotted>}
             {"type": "file_exists", "server": <domain>, "path": <dotted>}
             {"type": "cart_not_empty", "server": <domain>}
             {"type": "email_count_gte", "server": <domain>, "value": <int>}
@@ -252,12 +254,13 @@ class TaskReward:
 
         # Build a best-effort "final state" view from the latest event observation
         # whose schema is a dict.
-        final_state: dict[str, Any] | None = None
-        for ev in reversed(event_log.events):
-            obs = getattr(ev, "observation", None)
-            if isinstance(obs, dict) and obs:
-                final_state = obs
-                break
+        if not isinstance(final_state, dict) or not final_state:
+            final_state = None
+            for ev in reversed(event_log.events):
+                obs = getattr(ev, "observation", None)
+                if isinstance(obs, dict) and obs:
+                    final_state = obs
+                    break
 
         # Build set of ids that the trajectory created/updated/deleted, so
         # state_exists / state_equals can be approximated even without a
@@ -275,6 +278,7 @@ class TaskReward:
                 continue
             ctype = c.get("type", "")
             path = c.get("path", "")
+            path_ref = c.get("path_parts", path)
             if ctype == "missing_function":
                 # Handled by allowed_terminal_actions, not here
                 continue
@@ -282,16 +286,31 @@ class TaskReward:
                 if not path:
                     continue
                 # path is dotted: e.g. "events.evt_001"
-                target = path.rsplit(".", 1)[-1]
-                if target in seen_ids or self._lookup_state(final_state, path) is not None:
+                target = (
+                    str(path_ref[-1])
+                    if isinstance(path_ref, list) and path_ref
+                    else str(path).rsplit(".", 1)[-1]
+                )
+                if target in seen_ids or self._lookup_state(final_state, path_ref) is not None:
+                    completed += 1
+            elif ctype == "state_absent":
+                if not path:
+                    continue
+                if final_state is not None and self._lookup_state(final_state, path_ref) is None:
                     completed += 1
             elif ctype == "state_equals":
                 value = c.get("value")
-                actual = self._lookup_state(final_state, path)
+                actual = self._lookup_state(final_state, path_ref)
+                if actual is None and isinstance(path, str) and path.endswith(".messages_count"):
+                    messages = self._lookup_state(
+                        final_state, path.removesuffix("_count")
+                    )
+                    actual = len(messages) if isinstance(messages, list) else None
                 if actual is not None and str(actual) == str(value):
                     completed += 1
             elif ctype == "file_exists":
-                if self._lookup_state(final_state, path) is not None:
+                fs = self._lookup_state(final_state, "fs") if final_state else None
+                if isinstance(fs, dict) and path in fs:
                     completed += 1
             elif ctype == "cart_not_empty":
                 cart = self._lookup_state(final_state, "cart") if final_state else None
@@ -307,12 +326,13 @@ class TaskReward:
         return completed
 
     @staticmethod
-    def _lookup_state(state: dict | None, path: str) -> Any:
+    def _lookup_state(state: dict | None, path: str | list[str]) -> Any:
         """Walk a dotted path through a state dict; return None if missing."""
         if not state or not isinstance(state, dict) or not path:
             return None
         cur: Any = state
-        for part in path.split("."):
+        parts = path if isinstance(path, list) else path.split(".")
+        for part in parts:
             if isinstance(cur, dict) and part in cur:
                 cur = cur[part]
             else:
@@ -377,34 +397,27 @@ class TaskReward:
         """Extract unique tool names from model calls."""
         return {e.tool_name for e in tool_events if e.tool_name}
 
-    def _identify_aligned_calls(
+    def _match_required_calls_in_order(
         self,
         tool_events: list,
-        task: dict[str, Any],
         required_tool_calls: list[dict],
     ) -> list:
-        """Identify model calls that are 'aligned' with required tools.
-
-        A call is aligned if:
-          1. tool_name matches a required tool
-          2. the call advanced at least one predicate (execution_success or state_changed)
-        """
-        required_names = self._required_tool_names(required_tool_calls)
-        aligned = []
-        for e in tool_events:
-            if e.tool_name in required_names and (e.execution_success or e.state_changed):
-                aligned.append((e, self._find_required_call(required_tool_calls, e.tool_name)))
+        """Greedily align oracle calls to later successful model events."""
+        aligned: list[tuple[Any, dict]] = []
+        cursor = 0
+        for required in required_tool_calls:
+            required_name = required.get("tool_name", "")
+            required_keys = set((required.get("arguments") or {}).keys())
+            for idx in range(cursor, len(tool_events)):
+                event = tool_events[idx]
+                if event.tool_name != required_name or not event.execution_success:
+                    continue
+                if not required_keys.issubset(set((event.tool_arguments or {}).keys())):
+                    continue
+                aligned.append((event, required))
+                cursor = idx + 1
+                break
         return aligned
-
-    def _find_required_call(
-        self,
-        required_tool_calls: list[dict],
-        tool_name: str,
-    ) -> dict | None:
-        for c in required_tool_calls:
-            if c.get("tool_name") == tool_name:
-                return c
-        return None
 
     def _compute_arg_score(
         self,

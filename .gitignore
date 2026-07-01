@@ -54,3 +54,9 @@ wandb/
 
 # Misc
 tmp_*
+
+# Model cache / temp files
+*.msc
+*.mdl
+*.mv
+._____temp/

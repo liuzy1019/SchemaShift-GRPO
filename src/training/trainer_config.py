@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -59,7 +60,7 @@ class TrainerConfig:
     val_file: str = "data/val.parquet"
 
     # ── 训练规模 ──
-    total_steps: int = 200
+    total_steps: int = 350
     total_epochs: int = 1
     save_freq: int = 50
     val_before_train: bool = False
@@ -72,11 +73,11 @@ class TrainerConfig:
     val_batch_size: Optional[int] = None
 
     # ── Sequence ──
-    max_prompt_length: int = 10240
-    max_response_length: int = 2048
+    max_prompt_length: int = 12384
+    max_response_length: int = 16384
 
     # ── Rollout ──
-    rollout_n: int = 8
+    rollout_n: int = 16
     rollout_tp: int = 1
     max_num_seqs: int = 64
     temperature: float = 0.7
@@ -168,6 +169,21 @@ class TrainerConfig:
         val_batch = self.val_batch_size or self.train_batch_size
         max_num_batched_tokens = self.max_prompt_length + self.max_response_length
         run_name = self.generate_run_name()
+        effective_epochs = self.total_epochs
+        try:
+            import pyarrow.parquet as pq
+
+            n_rows = pq.ParquetFile(self.train_file).metadata.num_rows
+            steps_per_epoch = max(1, n_rows // self.train_batch_size)
+            effective_epochs = max(
+                effective_epochs,
+                math.ceil(self.total_steps / steps_per_epoch),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Could not infer epochs from {self.train_file}: {exc}; "
+                f"using total_epochs={effective_epochs}"
+            )
 
         overrides = [
             f"data.train_files={self.train_file}",
@@ -228,7 +244,7 @@ class TrainerConfig:
             # Trainer
             f"trainer.project_name={self.wandb_project}",
             f"trainer.experiment_name={run_name}",
-            f"trainer.total_epochs={self.total_epochs}",
+            f"trainer.total_epochs={effective_epochs}",
             f"trainer.total_training_steps={self.total_steps}",
             f"trainer.nnodes={self.nnodes}",
             f"trainer.n_gpus_per_node={self.devices}",

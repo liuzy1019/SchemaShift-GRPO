@@ -1,225 +1,309 @@
 # LiveMCP-GRPO
 
-> State-Machine Data Synthesis + Constrained GRPO for Multi-Step MCP Tool Use
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch 2.8](https://img.shields.io/badge/PyTorch-2.8-red.svg)](https://pytorch.org/)
+[![CUDA 12.8](https://img.shields.io/badge/CUDA-12.8-green.svg)](https://developer.nvidia.com/cuda-downloads)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![veRL 0.6.1](https://img.shields.io/badge/veRL-0.6.1-orange.svg)](https://github.com/volcengine/verl)
 
-PROVE-style state-machine teacher + live MCP execution + event-sourced reward + stratified advantage，训练模型在 10 个 domain / 188 个工具上进行多步工具调用。
-
-**当前方案：**
-- **数据生成**：PROVE state-machine (LLM-in-the-loop, Qwen3-32B) → `scripts/generate_data.py` → parquet
-- **Policy 模型**：Qwen3-4B
-- **奖励**：`J = R_task + I_shape·λ_shape·F_gamma + I_process·λ_process·P_process − λ_safe·C_safety`
-- **Advantage**：2D 分层 (perturbation_level × scenario_type) + LATA + 饱和跳过
-- **硬件**：支持多 tier 自适应 (L20 / A100 / A10 / Hopper / T4)，详见 `scripts/gpu_config.sh`
-
-### PROVE 对齐状态（2026-06-30 smoke30c 审计通过）
-
-6 条不变性全部通过对抗性审查（35/35，10 domain 全覆盖）：
-
-| 不变性 | 检测项 | 结果 |
-|--------|--------|------|
-| L1 | prompt tool_call ≡ extra_info.oracle_calls（语义一致） | ✅ 0/35 |
-| L2 | visible_tools + hidden_tools = domain tools（工具完整性） | ✅ 代码审查通过 |
-| L3 | scenario_type 正确反映扰动类型 | ✅ 代码审查通过 |
-| L4 | oracle chain ≤ 5（硬上限） | ✅ 0/35 |
-| L5 | tool_result 数量 = tool_call 数量（严格对齐） | ✅ 0/35 |
-| L6 | missing_function 的 oracle_calls 为空 | ✅ 0/35 |
-
-Chain 分布: min=0 max=5 avg=2.0；轮次: 1轮 5 / 2轮 16 / 3轮 14。
+> **State-Machine Data Synthesis × Constrained GRPO for Multi-Step MCP Tool-Use Agents**
+>
+> PROVE-style LLM-in-the-loop teacher + live MCP execution + event-sourced reward + 2D stratified advantage.
+> Trains agents on **10 domains, 188 tools** across banking, calendar, email, filesystem, CRM, payments, shopping, food delivery, issue tracking, and team chat.
 
 ---
 
-## 项目结构
+## 🎯 Problem & Motivation
+
+Multi-step tool-use agents face a **data-quality deadlock** — pure LLM synthesis produces hallucinatory traces, while pure template generation lacks realistic variability. When combined with GRPO training, outcome-only binary rewards cause **group saturation** and **collapsing reasoning depth**.
+
+We solve this with two integrated innovations:
+
+1. **PROVE State-Machine Synthesis** — LLM-in-the-loop teacher with full domain context (tools + live state + execution history), producing verified oracle traces through real MCP servers.
+2. **Constrained GRPO with Event-Sourced Reward** — `J = R_task + I_shape·λ_shape·F_gamma + I_process·λ_process·P_process − λ_safe·C_safety`, paired with 2D stratified advantage (`perturbation_level × scenario_type`) and LATA (Length-Aware Turn-Advantage).
+
+---
+
+## 💡 Method
+
+### Data Generation: PROVE State-Machine
 
 ```
-├── scripts/
-│   ├── generate_data.py             # 数据生成 CLI (PROVE state-machine)
-│   ├── generate_data.sh             # 统一生成脚本（自动检测模型大小+GPU拓扑+并行策略）
-│   ├── train_grpo.py                # GRPO 训练 Python 入口 (Hydra)
-│   ├── train_grpo.sh                # GRPO 训练 Shell 入口（PyTorch Lightning 风格配置）
-│   └── gpu_config.sh                # GPU 拓扑自动检测（共享库）
+Per domain, per persona:
+  1. Deterministic state seeding (state_seeder.py, 10 domains)
+  2. LLM-in-the-loop (task_planner.py):
+     teacher sees full domain context → plans next action (tool_call / clarification / terminal)
+  3. Real MCP execution (executor.py) → oracle trace
+  4. State delta → success_criteria (state_equals / state_exists / file_exists / …)
+  5. Perturbation injection:
+     · distractor tools (30%) — inject 3–8 irrelevant tools
+     · missing function (20%) — hide a required tool
+     · irrelevance query (5%) — request report_error for unrelated query
+  6. Position-aware Jaccard dedup (0.70 threshold)
+  7. Convert to verl-compatible parquet (prompt + reward_model + scenario_type)
+```
+
+Default difficulty distribution: **complete 60% / missing 20% / minimal 20%**.
+
+### GRPO Training: Constrained Advantage + Event-Sourced Reward
+
+```
+parquet → vLLM rollout → LiveMCPOvalLoop (real MCP execution + audit events)
+  → Reward: J = R_task + I_shape·λ_shape·F_gamma + I_process·λ_process·P_process − λ_safe·C_safety
+  → 2D StratAdv (perturbation_level × scenario_type) + LATA + saturation skip
+  → FSDP gradient update
+```
+
+**Key design decisions:**
+- **Event-sourced audit** — every tool call/result/safety violation produces an `AuditEvent`, not just final outcome.
+- **LATA** — replaces linear `advantage / L` normalization with `advantage / √L`, preserving marginal incentives for long reasoning chains.
+- **Saturation skip** — when a perturbation-level × scenario-type group reaches all-0 or all-1 rewards, skip its gradient to prevent deadlock.
+- **Adaptive λ** — shape/process reward coefficients update based on training dynamics.
+
+---
+
+## 🏗️ Project Structure
+
+```
+📦 livemcp-grpo/
+├── ⚙️ configs/                     # Hydra YAML configs
+│   ├── live_mcp/                   # 10 domain configs + suite_mvp.yaml
+│   ├── agent_loop.yaml             # Agent loop registration
+│   └── ds_zero2.json               # DeepSpeed ZeRO-2
 │
-├── src/
-│   ├── live_mcp/                    # MCP 环境 + 数据生成
-│   │   ├── task_planner.py          #   PROVE state-machine (LLM-in-the-loop)
-│   │   ├── orchestrator.py          #   任务编排 + 扰动 + 缺量守卫
-│   │   ├── state_seeder.py          #   确定性状态播种（10 domains）
-│   │   ├── api.py                   #   LiveMCPBranch 统一 API
-│   │   ├── llm_client.py            #   LLM 客户端 (vLLM / local)
-│   │   ├── dedup.py                 #   Jaccard 去重 (0.70，位置感知)
-│   │   ├── config.py                #   配置管理
-│   │   ├── errors.py                #   错误类型定义
-│   │   ├── executor.py              #   工具执行器
-│   │   ├── manager.py               #   MCP 服务器生命周期管理
-│   │   ├── oracle.py                #   Oracle 程序构建
-│   │   ├── reward.py                #   奖励计算（live_mcp 侧）
-│   │   ├── schema_registry.py       #   Schema 注册与查询
-│   │   ├── server_base.py           #   服务器基类
-│   │   ├── trace.py                 #   追踪记录
-│   │   ├── transport.py             #   传输层（subprocess stdio）
-│   │   ├── types.py                 #   核心类型定义（LiveTask, OracleCall 等）
-│   │   ├── agent_loop.py            #   Agent loop（live_mcp 侧）
-│   │   └── servers/ × 10           #   MCP 子进程服务器 (banking/calendar/crm/email/
-│   │                                #     filesystem/food_delivery/issue_tracker/
-│   │                                #     payments/shopping/team_chat)
+├── 💻 src/
+│   ├── 🏗️ live_mcp/                 # MCP environment + data synthesis
+│   │   ├── task_planner.py         #   PROVE state-machine (LLM-in-the-loop)
+│   │   ├── orchestrator.py         #   Task orchestration + perturbation + yield guard
+│   │   ├── state_seeder.py         #   Deterministic state seeding (10 domains)
+│   │   ├── dedup.py                #   Position-aware Jaccard dedup (0.70)
+│   │   ├── api.py                  #   LiveMCPBranch unified API
+│   │   ├── executor.py             #   Tool executor
+│   │   ├── manager.py              #   MCP server lifecycle
+│   │   ├── oracle.py               #   Oracle program builder
+│   │   ├── reward.py               #   Reward computation (live_mcp side)
+│   │   ├── schema_registry.py      #   Schema registry & query
+│   │   ├── state_seeder.py         #   10-domain seed state generation
+│   │   ├── transport.py            #   Subprocess stdio transport
+│   │   ├── types.py                #   Core types (LiveTask, OracleCall, …)
+│   │   └── servers/ × 10          #   MCP subprocess servers
 │   │
-│   ├── agent_loop/                  # verl Agent Loop
-│   │   ├── livemcp_oval_loop.py     #   LiveMCPOvalLoop（注册名 "livemcp_oval"）
-│   │   └── oval_mcp_worker.py       #   session + audit 包装
+│   ├── 🔄 agent_loop/              # verl Agent Loop
+│   │   ├── livemcp_oval_loop.py    #   LiveMCPOvalLoop ("livemcp_oval")
+│   │   └── oval_mcp_worker.py      #   Session + audit wrapper
 │   │
-│   ├── oval_mcp/                    # 奖励 + 约束 GRPO 算法（事件验证）
+│   ├── 🎯 oval_mcp/                # Reward + constrained GRPO algorithm
 │   │   ├── rewards/
-│   │   │   ├── task_reward.py       #   R_task 任务完成奖励
-│   │   │   ├── f_gamma.py           #   F_gamma 效率塑形
-│   │   │   ├── p_process.py         #   P_process 过程合理度
-│   │   │   └── scalar_return.py     #   ScalarReturn 聚合
+│   │   │   ├── task_reward.py      #   R_task: task completion reward
+│   │   │   ├── f_gamma.py          #   F_gamma: efficiency shaping
+│   │   │   ├── p_process.py        #   P_process: process reasonableness
+│   │   │   └── scalar_return.py    #   ScalarReturn aggregation
 │   │   ├── verifier/
-│   │   │   ├── events.py            #   AuditEvent / EventLog / TrajectoryEventLog
-│   │   │   └── safety.py            #   C_safety 安全约束验证
+│   │   │   ├── events.py           #   AuditEvent / EventLog / TrajectoryEventLog
+│   │   │   └── safety.py           #   C_safety: safety constraint verification
 │   │   ├── envs/
-│   │   │   ├── domain_adapter.py    #   DomainAdapter
-│   │   │   └── audit_wrapper.py     #   AuditWrapper
+│   │   │   ├── domain_adapter.py   #   DomainAdapter
+│   │   │   └── audit_wrapper.py    #   AuditWrapper
 │   │   └── training/
-│   │       ├── lambda_state.py      #   LambdaState λ 自适应更新
-│   │       ├── lata.py              #   LATA 分层自适应温度优势
-│   │       └── saturation.py        #   饱和组跳过
+│   │       ├── lambda_state.py     #   Adaptive λ update
+│   │       ├── lata.py             #   LATA: Length-Aware Turn-Advantage
+│   │       └── saturation.py       #   Saturation group skip
 │   │
-│   ├── reward/                      # verl 奖励入口
-│   │   ├── action_parser.py         #   Action 解析器
-│   │   └── oval_reward_fn.py        #   compute_score() 入口
+│   ├── 🎁 reward/                  # verl reward entry
+│   │   ├── action_parser.py        #   Action parser
+│   │   └── oval_reward_fn.py       #   compute_score() entry point
 │   │
-│   ├── training/                    # verl 训练组件
-│   │   ├── run_grpo.py              #   正式训练入口（OVAL Live MCP rollout）
-│   │   ├── trainer_config.py        #   TrainerConfig（PyTorch Lightning 风格配置）
-│   │   ├── register_estimator.py    #   estimator 注册 + λ 更新
+│   ├── 🏋️ training/                # verl training components
+│   │   ├── run_grpo.py             #   Official training entry
+│   │   ├── trainer_config.py       #   PyTorch Lightning-style config
 │   │   ├── livemcp_grpo_estimator.py #  2D StratAdv + LATA estimator
-│   │   ├── livemcp_advantage.py     #   Advantage 工厂
-│   │   ├── livemcp_hyperparams.py   #   超参数管理
-│   │   ├── livemcp_task_runner.py   #   TaskRunner
-│   │   ├── hooks.py                 #   训练钩子
-│   │   ├── length_check.py          #   Prompt 长度预检
-│   │   └── advantage_core.py        #   Advantage 核心计算
+│   │   ├── livemcp_advantage.py    #   Advantage factory
+│   │   ├── livemcp_hyperparams.py  #   Hyperparameters
+│   │   ├── livemcp_task_runner.py  #   TaskRunner
+│   │   ├── hooks.py                #   Training hooks
+│   │   ├── length_check.py         #   Prompt length pre-check
+│   │   ├── register_estimator.py   #   Estimator registration + λ update
+│   │   └── advantage_core.py       #   Core advantage computation
 │   │
-│   └── utils.py                     # 工具函数
+│   └── utils.py                    # Utilities
 │
-├── configs/
-│   ├── agent_loop.yaml              # Agent loop 注册
-│   ├── ds_zero2.json                # DeepSpeed ZeRO-2 配置
-│   └── live_mcp/                    # 10 domain + suite 配置
-│       ├── suite_mvp.yaml           #   全量套件（10 domain）
-│       ├── banking.yaml             #   Finance: banking
-│       ├── calendar.yaml            #   Productivity: calendar
-│       ├── crm.yaml                 #   CRM: crm
-│       ├── email.yaml               #   Productivity: email
-│       ├── filesystem.yaml          #   Productivity: filesystem
-│       ├── food_delivery.yaml       #   Lifestyle: food_delivery
-│       ├── issue_tracker.yaml       #   CRM: issue_tracker
-│       ├── payments.yaml            #   Finance: payments
-│       ├── shopping.yaml            #   Commerce: shopping
-│       └── team_chat.yaml           #   Social: team_chat
+├── 📜 scripts/
+│   ├── generate_data.py            # Data generation CLI (PROVE state-machine)
+│   ├── generate_data.sh            # Unified launcher (auto-detect GPU topology)
+│   ├── train_grpo.py               # GRPO training Python entry (Hydra)
+│   ├── train_grpo.sh               # GRPO training Shell entry
+│   ├── gpu_config.sh               # GPU topology auto-detection
+│   ├── inspect_prompts.py          # Prompt inspection utility
+│   └── test_runner.py              # Production smoke test runner
 │
-├── data/                            # 训练数据 + 实验记录（parquet gitignored）
-│   ├── train.parquet                # GRPO 训练数据
-│   ├── val.parquet                  # GRPO 验证数据
-│   ├── experiments/                 # 实验记录（配置+结果，跟踪入库）
-│   └── README.md                    # 数据目录规范
+├── 🧪 tests/
+│   ├── test_all_domains.py         # Full 10-domain tool coverage test
+│   ├── test_reward_contract.py     # Reward function contract test
+│   └── test_training_data_contract.py # Training data schema test
 │
-├── docs/
-│   └── OVAL-MCP.md                  # 权威方案文档
-├── reference/                       # 参考论文 (PROVE 等)
-├── verl/                            # verl 框架（vendored，editable install）
-├── pyproject.toml                   # 项目元数据与依赖
-├── requirements.txt                 # pip 依赖
-├── AGENTS.md                        # AI 协作约定
-├── CLAUDE.md                        # 工作入口 + 管线状态
-└── REVIEW.md                        # 审查报告 + 修复记录
+├── 📚 docs/
+│   └── OVAL-MCP.md                 # Authoritative design document
+│
+├── 🗂️ data/                        # Training data + experiment records
+│   └── README.md                   # Data directory specification
+│
+├── 📖 reference/                   # Reference papers (PROVE et al.)
+│
+├── 🧩 verl/                        # verl framework (vendored, editable install)
+│
+├── 📄 pyproject.toml               # Project metadata & dependencies
+├── 📄 requirements.txt             # pip dependencies
+└── 📄 CLAUDE.md                    # Entry point + pipeline status
 ```
 
 ---
 
-## 快速开始
+## 🚀 Quick Start
 
-### 1. 数据生成
+### 1. Environment
 
 ```bash
-# 统一生成（自动检测模型大小，选择最优并行策略：local 或 vLLM）
-bash scripts/generate_data.sh --model models/Qwen/Qwen3-8B --count 500
+conda create -n arl python=3.11 -y
+conda activate arl
+
+# Install verl from vendored source
+pip install -e ./verl
+
+# Install project
+pip install -e .
+pip install -e ".[train,rl]"
+```
+
+### 2. Data Generation
+
+```bash
+# Unified launcher (auto-detect model size + GPU topology)
 bash scripts/generate_data.sh --model models/Qwen/Qwen3-32B --count 500 --val-count 100
 
-# 单 domain 快速测试
+# Single domain quick test
 bash scripts/generate_data.sh --model models/Qwen/Qwen3-8B --domain calendar --count 200
 
-# 直接调用 Python CLI（高级用户）
+# Direct Python CLI (advanced)
 python scripts/generate_data.py \
     --model Qwen3-32B \
     --api-base http://localhost:8000/v1 \
     --count 500 --val-count 100
 ```
 
-### 2. GRPO 训练
+### 3. GRPO Training
 
 ```bash
-# PyTorch Lightning 风格配置（支持多卡、WandB、环境变量覆盖）
+# Default training
 bash scripts/train_grpo.sh
 
-# 指定 GPU 和步数
+# Custom GPU and steps
 bash scripts/train_grpo.sh --gpus 0,1,2,3 --total-steps 300
 
-# 启用 WandB
+# With WandB logging
 bash scripts/train_grpo.sh --wandb --wandb-project oval-mcp-grpo
 ```
 
----
+### 4. Validate
 
-## 管线说明
+```bash
+# Full domain tool coverage
+python tests/test_all_domains.py
 
-### 数据生成 (PROVE state-machine)
-
-```
-Per domain:
-  1. 确定性状态播种 (state_seeder.py，10 domains，每种 domain 多个 persona/日期)
-  2. LLM-in-the-loop (task_planner.py):
-     teacher 看到完整 domain context（tools + live state + execution history），
-     每轮决定下一步 action（tool_call / clarification / terminal）
-  3. 真实 MCP 执行 (executor.py) → oracle trace
-  4. 从 state delta 派生 success_criteria (state_equals / state_exists)
-  5. 扰动注入 (orchestrator.py):
-     - distractor tools (30%)：注入 3-8 个无关工具
-     - missing function (20%)：隐藏一个必需工具
-     - irrelevance query (5%)：要求 report_error 的无关查询
-  6. 位置感知 Jaccard 去重 (dedup.py, 阈值 0.70)
-  7. 转换为 verl 兼容 parquet (generate_data.py:
-     prompt JSON string + reward_model + extra_info + scenario_type)
+# Lightweight syntax check
+python -m compileall src scripts tests
 ```
 
-默认难度分布：complete 60% / missing 20% / minimal 20%。
-
-### GRPO 训练
-
-```
-parquet → vLLM rollout → LiveMCPOvalLoop（真实 MCP 执行 + 审计事件采集）
-  → Reward: J = R_task + I_shape·λ_shape·F_gamma + I_process·λ_process·P_process − λ_safe·C_safety
-  → 2D StratAdv (perturbation_level × scenario_type) + LATA + 饱和跳过
-  → FSDP gradient update
-```
-
-训练入口：`scripts/train_grpo.py` (Hydra) → `src/training/run_grpo.py` (正式入口)。
-配置通过 `src/training/trainer_config.py` (PyTorch Lightning 风格) 管理，支持 CLI 参数、环境变量 (`OVAL_*` 前缀)、GPU tier 自适应默认值。
+> **Hardware**: 8×L20 44GB (default). GPU tier auto-detection via `scripts/gpu_config.sh` — adapts batch size, TP size, and parallelism automatically.
+> **Teacher model**: Qwen3-32B (vLLM TP=4, GPU 4-7). **Policy model**: Qwen3-4B (GPU 0-3).
 
 ---
 
-## 文档
+## 🌟 Technical Highlights
 
-| 文档 | 内容 |
-|------|------|
-| [CLAUDE.md](CLAUDE.md) | 工作入口 + 管线状态 + 必守约束 |
-| [AGENTS.md](AGENTS.md) | AI 协作约定 + 环境事实 |
-| [docs/OVAL-MCP.md](docs/OVAL-MCP.md) | 权威方案文档（奖励函数、约束 GRPO 算法、事件系统） |
-| [data/README.md](data/README.md) | 数据目录规范 + Parquet Schema + 实验记录规范 |
-| [configs/README.md](configs/README.md) | 配置文件说明 + 环境变量覆盖 |
-| [REVIEW.md](REVIEW.md) | 审查报告 + 修复记录 |
+### 1. PROVE State-Machine Synthesis (Data Quality)
+A verified, LLM-in-the-loop data generation pipeline that produces **execution-grounded oracle traces**. Unlike pure LLM synthesis, every tool call in the trace is executed against a real MCP server and verified before inclusion.
+
+**Six invariants** enforced at generation time:
+- Tool calls in prompt ≡ tool calls in oracle trace
+- All domain tools present (visible + hidden)
+- Chain length ≤ 5 (three-layer hardware cap)
+- Every `tool_result` matches an executed `tool_call`
+- `missing_function` tasks have empty oracle
+- No teacher trace leakage into prompt
+
+### 2. Event-Sourced Reward (Signal Richness)
+Instead of binary outcome-only reward, the system captures a full `TrajectoryEventLog` — every tool call, result, safety check, and schema validation produces an auditable event. Reward decomposition:
+- **R_task** — task completion coverage (state criteria + operation assertions)
+- **F_gamma** — efficiency shaping (penalizes unnecessarily long chains)
+- **P_process** — process reasonableness (redundancy, placeholder, reasoning quality)
+- **C_safety** — safety constraint violations (schema validity, execution success)
+
+### 3. 2D Stratified Advantage + LATA (Training Stability)
+- **2D StratAdv** — groups trajectories by `perturbation_level × scenario_type`, computes per-group advantage to prevent cross-group signal contamination.
+- **LATA** — `advantage / √L` replaces `advantage / L`, preserving marginal incentives for longer reasoning.
+- **Saturation Skip** — detects all-0/all-1 groups and skips their gradients.
+- **Adaptive λ** — shape/process coefficients update based on reward statistics during training.
+
+### 4. Multi-Tier GPU Auto-Adaptation (Engineering)
+Single script (`scripts/gpu_config.sh`) detects GPU model (L20/A100/A10/Hopper/T4), VRAM, and count, then selects optimal batch sizes, TP sizes, and parallelism strategies — no manual tuning needed.
 
 ---
 
-## 许可
+## 📚 Documentation
+
+| Document | Content |
+|----------|---------|
+| [CLAUDE.md](CLAUDE.md) | Entry point: pipeline status, constraints, common commands |
+| [docs/OVAL-MCP.md](docs/OVAL-MCP.md) | Authoritative design: reward function, constrained GRPO, event system |
+| [data/README.md](data/README.md) | Data directory spec, parquet schema, experiment record format |
+| [configs/README.md](configs/README.md) | Config file reference, environment variable overrides |
+
+---
+
+## 🛠️ Tech Stack
+
+- **Training Framework**: [veRL](https://github.com/volcengine/verl) 0.6.1 (FSDP + vLLM V1)
+- **Teacher Model**: Qwen3-32B (vLLM)
+- **Policy Model**: Qwen3-4B
+- **Benchmark**: 10-domain Live MCP (188 tools)
+- **Inference Engine**: vLLM 0.11.0
+- **RL Algorithm**: GRPO with 2D stratified advantage + LATA
+- **Attention**: FlashAttention-2, FlashInfer
+
+---
+
+## 📜 Pipeline Status
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Data Generation Pipeline | ✅ | Complete 2–5 step oracle + stratified split |
+| OVAL Agent Loop | ✅ | Single-call protocol + initial-state hash + final-state evidence |
+| OVAL Reward | ✅ | Ordered coverage + task-aware safety |
+| GRPO Estimator | ✅ | Saturation skip + 2D stratified advantage |
+| GPU Auto-Adaptation | ✅ | Multi-tier (L20/A100/A10/Hopper/T4) |
+| Full Training Run | ⏳ | Pending data generation |
+
+---
+
+## 🔧 Design Constraints
+
+- Training scripts must not hardcode GPU count, batch size, micro batch, or TP size.
+- All project paths use repo-root-relative paths — no absolute machine paths.
+- Training hyperparams injectable via CLI args, environment variables (`OVAL_*` prefix), or Hydra override.
+- `data.max_prompt_length` ≥ 10240.
+- Ray temp dir uses short path (`/tmp/ssgrpo_ray`) to avoid AF_UNIX socket path overflow.
+- Illegal tool JSON does not produce `AuditEvent` (model receives error observation instead).
+
+---
+
+## 🙏 Acknowledgements
+
+- [veRL](https://github.com/volcengine/verl) — open-source RL training framework
+- [Qwen](https://github.com/QwenLM/Qwen) — strong base policy models
+- PROVE paper — state-machine data synthesis methodology
+
+---
+
+## 📄 License
 
 MIT License.

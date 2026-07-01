@@ -81,7 +81,12 @@ def _call_signatures(task: LiveTask) -> list[tuple[str, frozenset[str]]]:
     multiplicity are distinguishable.
     """
     calls = task.oracle_program.calls
-    if not calls:
+    has_tool_call = any(
+        (call.get("action", "tool_call") if isinstance(call, dict)
+         else getattr(call, "action", "tool_call")) == "tool_call"
+        for call in calls
+    )
+    if not has_tool_call:
         # Fallback: use original oracle program from metadata for
         # missing_function tasks (oracle_program.calls was cleared
         # in _apply_missing_function but original stored in metadata).
@@ -103,6 +108,10 @@ def _call_signatures(task: LiveTask) -> list[tuple[str, frozenset[str]]]:
             # native OracleCall dataclass
             tool_name = call.tool_name
             args = call.arguments or {}
+
+        action = call.get("action", "tool_call") if isinstance(call, dict) else getattr(call, "action", "tool_call")
+        if action != "tool_call":
+            continue
 
         if args:
             for k, v in sorted(args.items()):

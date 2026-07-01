@@ -37,25 +37,84 @@ reward_profile: payments_basic
 
 dependency_graph:
   edges:
-    - source_tool: create_invoice
-      target_tool: pay_invoice
-      relation: explicit
-      source_output_path: invoice_id
-      target_argument_path: invoice_id
-    - source_tool: pay_invoice
-      target_tool: get_invoice
-      relation: implicit
-      description: verify payment status after paying
-    - source_tool: get_invoice
-      target_tool: refund_invoice
-      relation: explicit
-      source_output_path: invoice_id
-      target_argument_path: invoice_id
+    # ── Invoice discovery → detail → operations ──
     - source_tool: list_invoices
       target_tool: get_invoice
       relation: explicit
-      source_output_path: invoice_id
+      source_output_path: invoices[].invoice_id
       target_argument_path: invoice_id
+    - source_tool: list_invoices
+      target_tool: pay_invoice
+      relation: explicit
+      source_output_path: invoices[].invoice_id
+      target_argument_path: invoice_id
+    - source_tool: list_invoices
+      target_tool: dispute_invoice
+      relation: explicit
+      source_output_path: invoices[].invoice_id
+      target_argument_path: invoice_id
+
+    # ── Invoice lifecycle ──
+    - source_tool: create_invoice
+      target_tool: pay_invoice
+      relation: explicit
+      source_output_path: invoice.invoice_id
+      target_argument_path: invoice_id
+    - source_tool: create_invoice
+      target_tool: get_invoice
+      relation: implicit
+      description: verify created invoice
+    - source_tool: create_invoice
+      target_tool: list_invoices
+      relation: implicit
+      description: verify invoice appears in listing
+
+    # ── Payment → verify → refund/cancel ──
+    - source_tool: pay_invoice
+      target_tool: get_invoice
+      relation: implicit
+      description: verify payment status
+    - source_tool: pay_invoice
+      target_tool: refund_invoice
+      relation: implicit
+      description: pay then refund
+    - source_tool: pay_invoice
+      target_tool: cancel_payment
+      relation: explicit
+      source_output_path: payment.payment_id
+      target_argument_path: payment_id
+    - source_tool: cancel_payment
+      target_tool: get_invoice
+      relation: implicit
+      description: verify cancellation reverts invoice
+
+    # ── Refund → verify ──
+    - source_tool: refund_invoice
+      target_tool: get_invoice
+      relation: implicit
+      description: verify refund status
+
+    # ── Dispute ──
+    - source_tool: get_invoice
+      target_tool: dispute_invoice
+      relation: explicit
+      source_output_path: invoice.invoice_id
+      target_argument_path: invoice_id
+
+    # ── Webhook lifecycle ──
+    - source_tool: create_webhook
+      target_tool: list_webhooks
+      relation: implicit
+      description: verify webhook registered
+    - source_tool: list_webhooks
+      target_tool: delete_webhook
+      relation: explicit
+      source_output_path: webhooks[].webhook_id
+      target_argument_path: webhook_id
+    - source_tool: delete_webhook
+      target_tool: list_webhooks
+      relation: implicit
+      description: verify webhook removed
 
 query_templates:
   payments_create_and_pay:

@@ -95,6 +95,12 @@ class OvalMCPWorkerContext:
         """重置 session 状态。"""
         self.manager.reset_session(session_id, seed=seed)
 
+    def get_state(self, session_id: str, domain: str) -> dict[str, Any]:
+        """Return the domain-local state snapshot for verifier use."""
+        state = self.manager.get_state(session_id, server_name=domain)
+        domain_state = state.get(domain, {})
+        return domain_state if isinstance(domain_state, dict) else {}
+
     def execute_with_audit(
         self,
         session_id: str,
@@ -139,6 +145,9 @@ class OvalMCPWorkerContext:
             pre_state=pre_state,
             post_state=post_state,
         )
+        actual_domain = (exec_result.metadata or {}).get("server_name")
+        if actual_domain and actual_domain != domain:
+            event.forbidden_transition = "cross_domain_distractor_call"
 
         return event, exec_result
 

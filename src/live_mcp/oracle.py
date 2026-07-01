@@ -37,6 +37,8 @@ class OracleValidator:
         results: list[ToolExecutionResult] = []
         try:
             for idx, call in enumerate(oracle_program.calls):
+                if getattr(call, "action", "tool_call") != "tool_call":
+                    continue
                 result = executor.execute(
                     session.session_id,
                     ToolCall(call.tool_name, dict(call.arguments), call_id=f"oracle_{idx}"),
@@ -65,7 +67,12 @@ def criterion_satisfied(final_state: dict[str, Any], criterion: dict[str, Any]) 
     server = criterion.get("server")
     state = final_state.get(server, {})
     if kind == "state_equals":
-        actual = _get_path(state, str(criterion["path"]))
+        actual = _get_path(state, criterion.get("path_parts", str(criterion["path"])))
+        if actual is None and str(criterion["path"]).endswith(".messages_count"):
+            messages = _get_path(
+                state, str(criterion["path"]).removesuffix("_count")
+            )
+            actual = len(messages) if isinstance(messages, list) else None
         expected = criterion.get("value")
         op = criterion.get("op", "eq")
         if op == "gt":
@@ -84,8 +91,11 @@ def criterion_satisfied(final_state: dict[str, Any], criterion: dict[str, Any]) 
     if kind == "cart_not_empty":
         return len(state.get("cart", [])) > 0
     if kind == "state_exists":
-        path = criterion.get("path", "")
+        path = criterion.get("path_parts", criterion.get("path", ""))
         return _get_path(state, path) is not None
+    if kind == "state_absent":
+        path = criterion.get("path_parts", criterion.get("path", ""))
+        return _get_path(state, path) is None
     if kind == "email_count_gte":
         count = len(state.get("emails", {}))
         expected = criterion.get("value", 0)
@@ -131,9 +141,10 @@ def criterion_satisfied(final_state: dict[str, Any], criterion: dict[str, Any]) 
     return False
 
 
-def _get_path(data: dict[str, Any], path: str) -> Any:
+def _get_path(data: dict[str, Any], path: str | list[str]) -> Any:
     value: Any = data
-    for part in path.split("."):
+    parts = path if isinstance(path, list) else path.split(".")
+    for part in parts:
         if not isinstance(value, dict):
             return None
         value = value.get(part)

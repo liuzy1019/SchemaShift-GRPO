@@ -22,6 +22,9 @@ data/
 
 ## 数据生成管线
 
+> 当前 `train.parquet` / `val.parquet` 是 2026-06-30 状态契约修复前数据，
+> 不得用于正式训练。重新生成后必须运行 `python production_smoke_test.py --live`。
+
 ```
 PROVE Teacher（LLM-in-the-loop，每轮决策）
   ┌──────────────────────────────────────────────────┐
@@ -67,7 +70,7 @@ PROVE Teacher（LLM-in-the-loop，每轮决策）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `prompt` | str | JSON 序列化的消息列表 `[{"role":"system",...},{"role":"user",...}]` |
+| `prompt` | str | 仅包含初始 `system + user`；不得包含 teacher tool history |
 | `data_source` | str | `"live_mcp_state_machine"` |
 | `reward_model` | dict | `{"style":"rule", "ground_truth": {"task_id","oracle_calls","success_criteria","required_tools"}}` |
 | `extra_info` | dict | domain, target_servers, required_tools, scenario_type, oracle_calls, hidden_tools 等 |
@@ -79,7 +82,7 @@ PROVE Teacher（LLM-in-the-loop，每轮决策）
 ### 关键约束
 
 - `reward_model.ground_truth.success_criteria` 是 **JSON 字符串**（非 list[dict]），避免 pyarrow 混合类型崩溃
-- `reward_model.ground_truth.oracle_calls` 中每个 call 包含 `action` 字段，区分 `tool_call` / `clarification`
+- `reward_model.ground_truth.oracle_calls` 保存完整 2-5 步工具链和一个显式终止动作；`action` 为 `tool_call` / `ask_clarification` / `final_answer` / `report_error`
 - `prompt` 是 JSON 字符串，OVAL loop 端自动 `json.loads` 恢复
 - `oracle_calls` 在 `extra_info` 中也是 JSON 字符串序列化，避免 pyarrow struct 统一化导致的字段丢失
 

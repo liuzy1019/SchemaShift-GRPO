@@ -217,6 +217,8 @@ class LiveMCPOvalLoop(AgentLoopBase):
             required_tools = [t.strip() for t in required_tools.split(",")]
         budget = extra_info.get("budget", self.max_turns)
         task_id = extra_info.get("task_id", str(uuid4().hex[:8]))
+        request_id = uuid4().hex
+        rid_short = request_id[:8]
 
         # ── 获取 OvalMCPWorkerContext ──
         if self._ctx is None:
@@ -232,6 +234,22 @@ class LiveMCPOvalLoop(AgentLoopBase):
         if isinstance(session_seed, str):
             session_seed = int(session_seed)
         session_id = ctx.create_session(seed=session_seed)
+
+        # A row is valid only for the exact deterministic initial state used by
+        # its teacher oracle.  Silent reset drift invalidates both reward and
+        # safety diagnostics.
+        expected_initial_hash = str(extra_info.get("initial_state_hash", ""))
+        if expected_initial_hash:
+            import hashlib
+            actual_state = ctx.get_state(session_id, task_domain)
+            canonical = json.dumps(actual_state, sort_keys=True, ensure_ascii=True, default=str)
+            actual_initial_hash = hashlib.sha256(canonical.encode()).hexdigest()
+            if actual_initial_hash != expected_initial_hash:
+                ctx.close_session(session_id)
+                raise RuntimeError(
+                    f"initial state hash mismatch for task={task_id}: "
+                    f"expected={expected_initial_hash[:12]} actual={actual_initial_hash[:12]}"
+                )
 
         # ── missing_function: blocked tools ──
         hidden_tools = extra_info.get("hidden_tools", [])
@@ -278,9 +296,6 @@ class LiveMCPOvalLoop(AgentLoopBase):
                 **self.apply_chat_template_kwargs,
             ),
         )
-
-        request_id = uuid4().hex
-        rid_short = request_id[:8]
 
         all_response_ids: list[int] = []
         all_response_mask: list[int] = []
@@ -369,10 +384,16 @@ class LiveMCPOvalLoop(AgentLoopBase):
 
             n_model_tool_calls += 1
 
-            if not all_parsed_calls:
+            if len(all_parsed_calls) != 1:
                 # JSON 解析失败 → 返回错误 observation
-                observation = "Error: Invalid tool call format. Please provide valid JSON."
-                logger.warning(f"[oval {rid_short}] turn={turn_idx} JSON 解析失败")
+                observation = (
+                    "Error: Emit exactly one valid <tool_call> per assistant turn; "
+                    f"received {len(all_parsed_calls)}."
+                )
+                logger.warning(
+                    f"[oval {rid_short}] turn={turn_idx} expected one tool call, "
+                    f"got {len(all_parsed_calls)}"
+                )
             else:
                 # 取第一个 tool_call 执行（串行模式）
                 parsed_call = all_parsed_calls[0]
@@ -433,6 +454,13 @@ class LiveMCPOvalLoop(AgentLoopBase):
         all_response_ids = all_response_ids[: self.response_length]
         all_response_mask = all_response_mask[: self.response_length]
 
+        # Capture verifier evidence before closing the isolated session.
+        final_state: dict[str, Any] = {}
+        try:
+            final_state = ctx.get_state(session_id, task_domain)
+        except Exception as e:
+            logger.warning(f"[oval {rid_short}] final state capture failed: {e}")
+
         # 清理 session
         try:
             ctx.close_session(session_id)
@@ -460,6 +488,7 @@ class LiveMCPOvalLoop(AgentLoopBase):
                 "domain": task_domain,
                 "required_tools": required_tools,
                 "session_id": session_id,
+                "final_state": final_state,
             },
         )
 

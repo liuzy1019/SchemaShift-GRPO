@@ -637,6 +637,54 @@ class DomainRuntimeSpec:
 
 ## 5. 任务数据
 
+### 5.0 训练样本状态契约（强制）
+
+Parquet 中每一行表示一个从确定性初始状态开始的独立 rollout。训练主数据统一采用：
+
+```text
+prompt = system(tool schemas) + one unresolved user request
+session = reset(session_seed)
+ground truth = 从该初始状态完成请求所需的完整 2-5 步 oracle tool calls
+terminal = final_answer | ask_clarification | report_error
+```
+
+工具 observation 驱动的多轮交互发生在 live agent loop 内，不把 teacher 已经执行过的
+assistant/tool 历史写入训练 prompt。否则必须在 policy 首次生成前，把 prompt 历史调用按原顺序
+重放进同 seed 的新 session，并校验每个 observation；只展示历史文本而不重放状态是无效样本。
+
+禁止以下转换：
+
+```text
+1. 只保留最后一个 user round 的 oracle，丢弃此前未展示给 policy 的必要调用；
+2. 最后一轮无工具调用时，把已经展示在 prompt 历史中的调用回填到 ground truth；
+3. success_criteria 从完整 teacher 会话派生，但 policy rollout 从未重放该会话状态；
+4. teacher 在一个 assistant turn 输出多个 tool_call，而 live rollout 只执行其中一个。
+```
+
+正式数据门禁：
+
+```text
+normal / distractor / recovery / unsafe-temptation:
+  2 <= real_oracle_tool_calls <= 5
+  serialized oracle 在 fresh reset(session_seed) 上 100% 可执行
+  exact-oracle rollout 的 R_coverage = 1 且 terminal predicate 通过
+  尽量从 state delta / observation 派生可执行 outcome predicate
+  （state_equals / state_exists / state_absent / file_exists / domain predicate）。
+  空 success_criteria 需要按 domain/scenario 报告；它是数据质量诊断，
+  不是比 PROVE 更硬的过滤门禁。纯 read-only 或合法 no-op trace 允许为空，
+  只要 replay executable 且 reward 仍能由 tool/result/terminal 证据计算。
+
+clarification / no-tool / missing-function:
+  real_oracle_tool_calls = 0
+  terminal action 必须显式保存且与 allowed_terminal_actions 一致
+
+all rows:
+  prompt 不含 ground-truth oracle 泄漏
+  每个 assistant turn 最多一个 tool_call
+  train/val 按 task semantic fingerprint 分组后分层切分，无语义泄漏
+  val 按 scenario_type 近似保持总体比例，同时覆盖全部 domain 与全部 scenario_type
+```
+
 每条任务：
 
 ```json
@@ -826,7 +874,10 @@ Per conversation:
        - email/team_chat:    paginated_response, partial_batch_failure
   6. replay completed conversation against fresh reset
   7. keep only executable traces that pass validation
-  8. instantiate DomainAdapter predicates:
+  8. report empty success_criteria by domain/scenario for data-quality
+     diagnostics; do not reject replay-valid traces solely for empty state
+     delta
+  9. instantiate DomainAdapter predicates:
      outcome_assertions, safety_constraints, progress_predicates, budget_policy
 ```
 

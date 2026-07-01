@@ -39,31 +39,110 @@ reward_profile: crm_basic
 
 dependency_graph:
   edges:
+    # ── Lead discovery → operations ──
     - source_tool: list_leads
-      target_tool: create_deal
+      target_tool: update_lead
       relation: explicit
-      source_output_path: lead_id
+      source_output_path: leads[].lead_id
+      target_argument_path: lead_id
+    - source_tool: list_leads
+      target_tool: convert_lead
+      relation: explicit
+      source_output_path: leads[].lead_id
+      target_argument_path: lead_id
+    - source_tool: list_leads
+      target_tool: delete_lead
+      relation: explicit
+      source_output_path: leads[].lead_id
+      target_argument_path: lead_id
+    - source_tool: list_leads
+      target_tool: add_note
+      relation: implicit
+      description: note on a lead from listing
+
+    # ── Lead lifecycle ──
+    - source_tool: create_lead
+      target_tool: update_lead
+      relation: explicit
+      source_output_path: lead.lead_id
       target_argument_path: lead_id
     - source_tool: create_lead
       target_tool: convert_lead
       relation: explicit
-      source_output_path: lead_id
+      source_output_path: lead.lead_id
       target_argument_path: lead_id
+    - source_tool: create_lead
+      target_tool: list_leads
+      relation: implicit
+      description: verify new lead in listing
+    - source_tool: update_lead
+      target_tool: list_leads
+      relation: implicit
+      description: verify updated lead
+
+    # ── Lead → contact → deal pipeline ──
     - source_tool: convert_lead
+      target_tool: create_deal
+      relation: explicit
+      source_output_path: contact.contact_id
+      target_argument_path: contact_id
+
+    # ── Contact management ──
+    - source_tool: create_contact
+      target_tool: update_contact
+      relation: explicit
+      source_output_path: contact.contact_id
+      target_argument_path: contact_id
+    - source_tool: update_contact
       target_tool: create_deal
       relation: explicit
       source_output_path: contact_id
       target_argument_path: contact_id
-    - source_tool: create_deal
-      target_tool: update_deal
-      relation: explicit
-      source_output_path: deal_id
-      target_argument_path: deal_id
+
+    # ── Deal discovery → detail → operations ──
     - source_tool: list_deals
       target_tool: get_deal
       relation: explicit
-      source_output_path: deal_id
+      source_output_path: deals[].deal_id
       target_argument_path: deal_id
+    - source_tool: list_deals
+      target_tool: update_deal
+      relation: explicit
+      source_output_path: deals[].deal_id
+      target_argument_path: deal_id
+    - source_tool: create_deal
+      target_tool: update_deal
+      relation: explicit
+      source_output_path: deal.deal_id
+      target_argument_path: deal_id
+    - source_tool: create_deal
+      target_tool: list_deals
+      relation: implicit
+      description: verify new deal in pipeline
+    - source_tool: update_deal
+      target_tool: get_deal
+      relation: implicit
+      description: verify updated deal stage
+
+    # ── Deal → tasks and notes ──
+    - source_tool: get_deal
+      target_tool: create_task
+      relation: implicit
+      description: create task for a deal
+    - source_tool: get_deal
+      target_tool: add_note
+      relation: implicit
+      description: add note to a deal
+    - source_tool: list_tasks
+      target_tool: complete_task
+      relation: explicit
+      source_output_path: tasks[].task_id
+      target_argument_path: task_id
+    - source_tool: create_task
+      target_tool: complete_task
+      relation: explicit
+      source_output_path: task.task_id
+      target_argument_path: task_id
 
 query_templates:
   crm_lead_to_deal:

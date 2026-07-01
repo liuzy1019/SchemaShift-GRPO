@@ -17,7 +17,7 @@ from typing import Protocol
 from src.live_mcp import errors
 from src.live_mcp.executor import LiveMCPExecutor
 from src.live_mcp.manager import LiveMCPManager
-from src.live_mcp.reward import RewardComposer
+from src.live_mcp.reward import RewardComposer, _expects_abstention
 from src.live_mcp.trace import TraceRecorder, prompt_hash
 from src.live_mcp.types import LiveTask, RolloutTrace, ToolCall, TraceTurn
 from src.reward.action_parser import ActionParser
@@ -53,6 +53,12 @@ class OracleGenerationBackend:
         if self.idx < len(self.task.oracle_program.calls):
             call = self.task.oracle_program.calls[self.idx]
             self.idx += 1
+            if call.action == "final_answer":
+                return f"<final_answer>{call.arguments.get('text', 'Done.')}</final_answer>"
+            if call.action == "ask_clarification":
+                return f"<ask_clarification>{call.arguments.get('question', '')}</ask_clarification>"
+            if call.action == "report_error":
+                return f"<report_error>{call.arguments.get('text', '')}</report_error>"
             return f"<tool_call>{json.dumps({'name': call.tool_name, 'arguments': call.arguments}, ensure_ascii=True)}</tool_call>"
         return "<final_answer>Done.</final_answer>"
 
@@ -155,7 +161,3 @@ class MCPToolsAgentLoop:
         tools = json.dumps(task.visible_tools, ensure_ascii=True)
         obs = "\n".join(observations)
         return f"User: {task.user_prompt}\nTools: {tools}\nObservations:\n{obs}\nAssistant:"
-
-
-def _expects_abstention(task: LiveTask) -> bool:
-    return task.task_type == "missing_function" or any(criterion.get("type") == "missing_function" for criterion in task.success_criteria)

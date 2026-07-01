@@ -76,7 +76,7 @@ else
     MODEL_PATH="${PROJECT_ROOT}/${MODEL}"
 fi
 
-MODEL_INFO=$(python3 -c "
+MODEL_INFO=$(python -c "
 import json, sys
 try:
     cfg_path = '${MODEL_PATH}/config.json'
@@ -108,7 +108,7 @@ echo ""
 echo "Model: ${MODEL_PARAMS_B}B params (~${MODEL_BF16_GB} GB BF16), ${MODEL_NUM_HEADS} heads"
 
 # Heuristic: model fits if BF16 size < 70% of single GPU memory
-FITS_SINGLE_GPU=$(python3 -c "
+FITS_SINGLE_GPU=$(python -c "
 fits = ${MODEL_BF16_GB} < ${GPU_MEM_GB} * 0.70
 print('1' if fits else '0')
 ")
@@ -159,7 +159,7 @@ if [ "$FITS_SINGLE_GPU" = "1" ]; then
 
         echo "  [shard $i] GPU=${GPU_ID}, train=${PER_GPU_TRAIN}, val=${PER_GPU_VAL}, seed=${SHARD_SEED}"
 
-        CUDA_VISIBLE_DEVICES="${GPU_ID}" python3 scripts/generate_data.py \
+        CUDA_VISIBLE_DEVICES="${GPU_ID}" python scripts/generate_data.py \
             --count "${PER_GPU_TRAIN}" \
             --val-count "${PER_GPU_VAL}" \
             --seed "${SHARD_SEED}" \
@@ -185,33 +185,63 @@ if [ "$FITS_SINGLE_GPU" = "1" ]; then
         exit 1
     fi
 
-    # Merge
-    python3 -c "
-import pandas as pd, sys
+    # Merge with global semantic dedup and integrity audit.
+    python -c "
+import pandas as pd, json, sys, hashlib
 from pathlib import Path
-tmpdir = Path('${TMPDIR_SHARD}')
+
+def _row_fingerprint(row):
+    ei = row['extra_info']
+    if isinstance(ei, str): ei = json.loads(ei)
+    domain = ei.get('domain', '')
+    query = ' '.join((ei.get('user_query', '') or '').lower().split())
+    oc = ei.get('oracle_calls', [])
+    if isinstance(oc, str): oc = json.loads(oc)
+    sig = json.dumps({'d': domain, 'q': query, 'c': oc}, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(sig.encode()).hexdigest()
+
 def merge(pattern, outpath, target):
-    dfs = [pd.read_parquet(p) for p in sorted(tmpdir.glob(pattern))]
+    dfs = [pd.read_parquet(p) for p in sorted(Path('${TMPDIR_SHARD}').glob(pattern))]
     if not dfs: print(f'WARNING: no {pattern} data!'); return False
     merged = pd.concat(dfs, ignore_index=True)
-    # P2-10: shards round up; trim to the contractual count.
+    # P1-5: global semantic dedup across shards.
+    before = len(merged)
+    seen = set()
+    keep = []
+    for _, row in merged.iterrows():
+        fp = _row_fingerprint(row)
+        if fp not in seen:
+            seen.add(fp)
+            keep.append(row.to_dict())
+    merged = pd.DataFrame(keep)
+    dropped = before - len(merged)
+    if dropped:
+        print(f'  dedup: dropped {dropped} cross-shard duplicates, {len(merged)} remaining')
     if target is not None and target > 0 and len(merged) > target:
         merged = merged.head(target).reset_index(drop=True)
     merged.to_parquet(outpath, index=False)
     print(f'  {outpath}: {len(merged)} rows (target={target})')
-    return True
-ok = merge('shard_*_train.parquet', '${OUTPUT_DIR}/train.parquet', ${COUNT})
-merge('shard_*_val.parquet', '${OUTPUT_DIR}/val.parquet', ${VAL_COUNT})
-if not ok: sys.exit(1)
+    return True, merged
+
+ok1, train_df = merge('shard_*_train.parquet', '${OUTPUT_DIR}/train.parquet', ${COUNT})
+ok2, val_df = merge('shard_*_val.parquet', '${OUTPUT_DIR}/val.parquet', ${VAL_COUNT})
+if not (ok1 and ok2): sys.exit(1)
+# P1-5: cross-dataset integrity quickcheck.
+train_ids = {r['extra_info'].get('task_id','') if isinstance(r['extra_info'],dict) else json.loads(r['extra_info']).get('task_id','') for _, r in train_df.iterrows()}
+val_ids = {r['extra_info'].get('task_id','') if isinstance(r['extra_info'],dict) else json.loads(r['extra_info']).get('task_id','') for _, r in val_df.iterrows()}
+overlap = train_ids & val_ids
+if overlap: print(f'WARNING: {len(overlap)} train/val task_id overlaps!')
+print(f'  merge ok: {len(train_df)} train + {len(val_df)} val, {len(overlap)} overlaps')
 "
     rm -f "${TMPDIR_SHARD}"/shard_*_train.parquet "${TMPDIR_SHARD}"/shard_*_val.parquet
 
 # ═════════════════════════════════════════════════════════════════
 # MODE 2: vLLM API — TP across multiple GPUs
 # ═════════════════════════════════════════════════════════════════
-else:    # Calculate optimal TP and number of vLLM instances
+else
+    # Calculate optimal TP and number of vLLM instances.
     # vLLM requires TP to divide num_attention_heads evenly
-    TP_SIZE=$(python3 -c "
+    TP_SIZE=$(python -c "
 import math
 mem_need = ${MODEL_BF16_GB}
 mem_gpu = ${GPU_MEM_GB}
@@ -250,18 +280,19 @@ print(tp)
     for ((inst=0; inst<NUM_INSTANCES; inst++)); do
         GPU_START=$(( inst * TP_SIZE ))
         GPU_END=$(( GPU_START + TP_SIZE - 1 ))
-        GPU_LIST=$(IFS=','; echo "${GPU_INDEX_ARRAY[@]:$GPU_START:$TP_SIZE}")
+        GPU_SLICE=("${GPU_INDEX_ARRAY[@]:$GPU_START:$TP_SIZE}")
+        GPU_LIST=$(IFS=','; echo "${GPU_SLICE[*]}")
         PORT=$(( PORT_START + inst ))
         LOG="${OUTPUT_DIR}/vllm_instance${inst}_$(date +%H%M).log"
 
         echo "  Starting vLLM instance ${inst} on GPUs ${GPU_LIST}, port ${PORT}"
 
-        CUDA_VISIBLE_DEVICES="${GPU_LIST}" python3 -m vllm.entrypoints.openai.api_server \
+        CUDA_VISIBLE_DEVICES="${GPU_LIST}" python -m vllm.entrypoints.openai.api_server \
             --model "${MODEL}" \
             --served-model-name "$(basename ${MODEL})-Instruct" \
             --tensor-parallel-size "${TP_SIZE}" \
             --gpu-memory-utilization 0.82 \
-            --max-model-len 8192 \
+        --max-model-len 12288 \
             --max-num-seqs 4 \
             --port "${PORT}" \
             > "${LOG}" 2>&1 &
@@ -275,9 +306,17 @@ print(tp)
 
     for ((inst=0; inst<NUM_INSTANCES; inst++)); do
         PORT=$(( PORT_START + inst ))
+        PID="${VLLM_PIDS[$inst]}"
+        SERVED_MODEL="$(basename "${MODEL}")-Instruct"
         WAITED=0
         while [ $WAITED -lt $MAX_WAIT ]; do
-            if curl -s "http://localhost:${PORT}/health" > /dev/null 2>&1; then
+            if ! kill -0 "${PID}" 2>/dev/null; then
+                echo "ERROR: vLLM instance ${inst} exited during startup; see ${LOG}" >&2
+                exit 1
+            fi
+            MODELS_JSON=$(curl -sf "http://localhost:${PORT}/v1/models" 2>/dev/null || true)
+            if [[ "${MODELS_JSON}" == *"\"id\":\"${SERVED_MODEL}\""* ]] || \
+               [[ "${MODELS_JSON}" == *"\"id\": \"${SERVED_MODEL}\""* ]]; then
                 echo "  Instance ${inst} (port ${PORT}) ready after ${WAITED}s"
                 break
             fi
@@ -301,7 +340,7 @@ print(tp)
 
         echo "  Instance ${inst}: train=${PER_INSTANCE_TRAIN}, val=${PER_INSTANCE_VAL}, seed=${SHARD_SEED}"
 
-        python3 scripts/generate_data.py \
+        python scripts/generate_data.py \
             --count "${PER_INSTANCE_TRAIN}" \
             --val-count "${PER_INSTANCE_VAL}" \
             --seed "${SHARD_SEED}" \
@@ -328,24 +367,51 @@ print(tp)
         exit 1
     fi
 
-    # Merge
-    python3 -c "
-import pandas as pd, sys
+    # Merge with global semantic dedup and integrity audit.
+    python -c "
+import pandas as pd, json, sys, hashlib
 from pathlib import Path
-tmpdir = Path('${TMPDIR_SHARD}')
+
+def _row_fingerprint(row):
+    ei = row['extra_info']
+    if isinstance(ei, str): ei = json.loads(ei)
+    domain = ei.get('domain', '')
+    query = ' '.join((ei.get('user_query', '') or '').lower().split())
+    oc = ei.get('oracle_calls', [])
+    if isinstance(oc, str): oc = json.loads(oc)
+    sig = json.dumps({'d': domain, 'q': query, 'c': oc}, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(sig.encode()).hexdigest()
+
 def merge(pattern, outpath, target):
-    dfs = [pd.read_parquet(p) for p in sorted(tmpdir.glob(pattern))]
+    dfs = [pd.read_parquet(p) for p in sorted(Path('${TMPDIR_SHARD}').glob(pattern))]
     if not dfs: print(f'WARNING: no {pattern} data!'); return False
     merged = pd.concat(dfs, ignore_index=True)
-    # P2-10: instances round up; trim to the contractual count.
+    before = len(merged)
+    seen = set()
+    keep = []
+    for _, row in merged.iterrows():
+        fp = _row_fingerprint(row)
+        if fp not in seen:
+            seen.add(fp)
+            keep.append(row.to_dict())
+    merged = pd.DataFrame(keep)
+    dropped = before - len(merged)
+    if dropped:
+        print(f'  dedup: dropped {dropped} cross-shard duplicates, {len(merged)} remaining')
     if target is not None and target > 0 and len(merged) > target:
         merged = merged.head(target).reset_index(drop=True)
     merged.to_parquet(outpath, index=False)
     print(f'  {outpath}: {len(merged)} rows (target={target})')
-    return True
-ok = merge('shard_*_train.parquet', '${OUTPUT_DIR}/train.parquet', ${COUNT})
-merge('shard_*_val.parquet', '${OUTPUT_DIR}/val.parquet', ${VAL_COUNT})
-if not ok: sys.exit(1)
+    return True, merged
+
+ok1, train_df = merge('shard_*_train.parquet', '${OUTPUT_DIR}/train.parquet', ${COUNT})
+ok2, val_df = merge('shard_*_val.parquet', '${OUTPUT_DIR}/val.parquet', ${VAL_COUNT})
+if not (ok1 and ok2): sys.exit(1)
+train_ids = {r['extra_info'].get('task_id','') if isinstance(r['extra_info'],dict) else json.loads(r['extra_info']).get('task_id','') for _, r in train_df.iterrows()}
+val_ids = {r['extra_info'].get('task_id','') if isinstance(r['extra_info'],dict) else json.loads(r['extra_info']).get('task_id','') for _, r in val_df.iterrows()}
+overlap = train_ids & val_ids
+if overlap: print(f'WARNING: {len(overlap)} train/val task_id overlaps!')
+print(f'  merge ok: {len(train_df)} train + {len(val_df)} val, {len(overlap)} overlaps')
 "
     rm -f "${TMPDIR_SHARD}"/shard_*_train.parquet "${TMPDIR_SHARD}"/shard_*_val.parquet
 fi
@@ -353,7 +419,7 @@ fi
 # ── Print stats ────────────────────────────────────────────────────
 echo ""
 echo "=== Generation Complete ==="
-python3 -c "
+python -c "
 import pandas as pd
 for path in ['${OUTPUT_DIR}/train.parquet', '${OUTPUT_DIR}/val.parquet']:
     df = pd.read_parquet(path)

@@ -10,16 +10,16 @@ from src.live_mcp.types import LiveTask, RolloutTrace, ToolExecutionResult
 
 
 class RewardComposer:
-    def __init__(self, weights: dict[str, float] | None = None, alpha: float = 0.5, lambda_eff: float = 0.05):
+    def __init__(self, weights: dict[str, float] | None = None, alpha: float = 0.5):
+        # PROVE §3.3 reward weights: w_val=0.5, w_cov=0.5, w_eff=0.15, w_name=0.2, w_arg=0.1
         self.weights = weights or {
-            "validity": 0.25,
-            "coverage": 0.25,
-            "efficiency": 0.10,
-            "tool_selection": 0.20,
-            "argument_value": 0.20,
+            "validity": 0.5,
+            "coverage": 0.5,
+            "efficiency": 0.15,
+            "tool_selection": 0.2,
+            "argument_value": 0.1,
         }
-        self.alpha = alpha
-        self.lambda_eff = lambda_eff
+        self.alpha = alpha  # PROVE α=0.5, used both in budget slack β and penalty scale
 
     def compute(
         self,
@@ -35,7 +35,11 @@ class RewardComposer:
         coverage = abstention if expects_abstention else self._coverage(task, results)
         if final_state is not None and not all(criterion_satisfied(final_state, c) for c in task.success_criteria):
             coverage = min(coverage, 0.99)
-        efficiency = self._efficiency(len(model_calls), len(task.oracle_program.calls))
+        oracle_tool_calls = [
+            call for call in task.oracle_program.calls
+            if getattr(call, "action", "tool_call") == "tool_call"
+        ]
+        efficiency = self._efficiency(len(model_calls), len(oracle_tool_calls))
         tool_selection = self._tool_selection(task, results, no_tool_expected=expects_abstention)
         argument_value = self._argument_value(task, model_calls, no_tool_expected=expects_abstention)
         score = (
@@ -70,7 +74,10 @@ class RewardComposer:
         return sum(scores) / len(scores)
 
     def _coverage(self, task: LiveTask, results: list[ToolExecutionResult]) -> float:
-        oracle_names = [call.tool_name for call in task.oracle_program.calls]
+        oracle_names = [
+            call.tool_name for call in task.oracle_program.calls
+            if getattr(call, "action", "tool_call") == "tool_call"
+        ]
         pos = 0
         for result in results:
             if pos < len(oracle_names) and result.canonical_tool_name == oracle_names[pos] and result.success:
@@ -78,24 +85,37 @@ class RewardComposer:
         return pos / len(oracle_names) if oracle_names else 1.0
 
     def _efficiency(self, model_call_count: int, gt_call_count: int) -> float:
+        """PROVE §3.3: R_eff = max(0, 1 - α * max(0, n - B) / B).
+
+        B = n_gt + ⌈α * n_gt⌉  (budget with slack), α = 0.5.
+        Penalty is proportional to excess relative to budget, not absolute excess.
+        """
         if gt_call_count <= 0:
             return 1.0 if model_call_count == 0 else 0.0
-        budget = gt_call_count + math.ceil(self.alpha * gt_call_count)
-        excess = max(0, model_call_count - budget)
-        return max(0.0, 1.0 - self.lambda_eff * excess)
+        B = gt_call_count + math.ceil(self.alpha * gt_call_count)
+        excess = max(0, model_call_count - B)
+        return max(0.0, 1.0 - self.alpha * excess / B)
 
     def _tool_selection(self, task: LiveTask, results: list[ToolExecutionResult], no_tool_expected: bool = False) -> float:
         if no_tool_expected:
             return 1.0 if not results else 0.0
         if not results:
             return 0.0
-        allowed = set(task.required_tools) | {call.tool_name for call in task.oracle_program.calls}
+        allowed = set(task.required_tools) | {
+            call.tool_name for call in task.oracle_program.calls
+            if getattr(call, "action", "tool_call") == "tool_call"
+        }
         return sum(1 for result in results if result.canonical_tool_name in allowed) / len(results)
 
     def _argument_value(self, task: LiveTask, model_calls: list[Any], no_tool_expected: bool = False) -> float:
         if no_tool_expected:
             return 1.0 if not model_calls else 0.0
-        expected = {(call.tool_name, key): value for call in task.oracle_program.calls for key, value in call.arguments.items()}
+        expected = {
+            (call.tool_name, key): value
+            for call in task.oracle_program.calls
+            if getattr(call, "action", "tool_call") == "tool_call"
+            for key, value in call.arguments.items()
+        }
         if not expected:
             return 1.0
         checked = 0

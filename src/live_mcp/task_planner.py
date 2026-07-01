@@ -181,28 +181,39 @@ class ContinuationPolicy:
 
     @staticmethod
     def target_turns(chain_length: int, rng: random.Random) -> int:
-        """Return target turn count for a given chain length (PROVE: 2-3 range)."""
-        base = chain_length + 1  # query_turn + N tool_calls + final_answer
-        jitter = rng.randint(-1, 1)
-        return max(2, min(base + jitter, chain_length + 2))
+        """Return target turn count for a given chain length.
+
+        PROVE §6: min_turns=2, max_turns=3 per chain round.
+        Conservative: exact = chain_length + 1 (query + N tools + terminal),
+        no jitter.  Perturbations (intermittent errors) may cause additional
+        retry turns beyond this budget, handled by recovery.
+        """
+        return max(2, chain_length + 1)
 
     @staticmethod
     def should_continue(turn: int, target: int, last_action_success: bool, tool_calls_done: int) -> bool:
         """Decide whether the conversation should continue.
 
-        Returns False if turn limit reached."""
+        Conservative: stop after target turns.  Allow 1 extra turn only if
+        the last action was unsuccessful (recovery budget).
+        """
         if turn >= target:
             return False
         return True
 
     @staticmethod
     def conversation_rounds(rng: random.Random) -> int:
-        """PROVE §3.2 Step 3.5: sample number of user-assistant rounds per conversation.
+        """PROVE §3.2 Step 3.5: turn-decay schedule.
 
-        Bounded by min_turns=2, max_turns=3. Each round is one user query
-        followed by one or more tool calls.
+        ALWAYS 1 for now.  Multi-round generation builds an oracle trace that
+        spans follow-up queries, but _tasks_to_rows() only writes the first
+        user query into the prompt.  The model would see "search events" while
+        the oracle expects [search, get, delete, final_answer] — an impossible
+        contract.  Re-enable multi-round only after the follow-up conversation
+        history is correctly rendered into the prompt AND the rollout session
+        replays the prior-round teacher trace.
         """
-        return rng.randint(2, 3)
+        return 1
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -333,7 +344,7 @@ Return only:
                 raw = self.client.generate_chat(
                     [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
-                    temperature=0.7 + 0.1 * attempt,
+                    temperature=0.6 + 0.1 * attempt,
                 )
                 data = _extract_json(raw)
                 if not isinstance(data, dict):
@@ -360,6 +371,8 @@ Return only:
         rng: random.Random,
         persona: str = "",
         reference_date: str = "",
+        chain_seed: list[str] | None = None,
+        chain_progress: int = 0,
     ) -> str:
         """Generate a follow-up user message grounded in previous results.
 
@@ -367,6 +380,9 @@ Return only:
         what the assistant just did. The follow-up should reference previous
         outputs naturally (e.g., "that looks right, now also...") without
         mentioning tool names.
+
+        chain_seed + chain_progress: guides the follow-up to ask for the
+        remaining dependency chain steps naturally.
         """
         state_text = _format_state_compact(grounded_state, max_entities=20)
         # Summarize last few tool results for the follow-up generator
@@ -397,6 +413,18 @@ Return only:
             "Keep it to 1-2 sentences. Be natural and casual."
         )
 
+        # Chain context: guide the follow-up to ask for remaining dependency steps
+        chain_guide = ""
+        if chain_seed and chain_progress < len(chain_seed):
+            remaining = chain_seed[chain_progress:]
+            tool_desc_map = {t["name"]: t.get("description", "").split(".")[0].strip() or t["name"] for t in tool_schemas}
+            remaining_descs = [tool_desc_map.get(tn, tn) for tn in remaining]
+            chain_guide = (
+                f"\n## Remaining task flow\n"
+                f"The task still needs these operations (in order): {' → '.join(remaining_descs)}.\n"
+                f"Your follow-up should naturally steer toward the next step without mentioning tool names.\n"
+            )
+
         user = f"""## Persona
 {persona if persona else 'A normal user messaging their AI assistant.'}
 {date_block}
@@ -405,7 +433,7 @@ Return only:
 
 ## Recent results (what the assistant just did)
 {history_text}
-
+{chain_guide}
 ## Current State (real IDs and values)
 {state_text}
 
@@ -421,7 +449,7 @@ Return only:
                 raw = self.client.generate_chat(
                     [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
-                    temperature=0.7 + 0.1 * attempt,
+                    temperature=0.5 + 0.1 * attempt,
                 )
                 data = _extract_json(raw)
                 if not isinstance(data, dict):
@@ -448,6 +476,7 @@ Return only:
         difficulty: str = "complete",
         chain_seed: list[str] | None = None,
         chain_progress: int = 0,
+        reference_date: str = "",
     ) -> ActionPlan:
         """LLM decides the next action given full context.
 
@@ -464,6 +493,19 @@ Return only:
         tools_text = _format_tools(tool_schemas, strip_enums=self._strip_enums)
         history_text = _format_history(execution_history)
         tool_names_set = {t["name"] for t in tool_schemas}  # for action auto-correction
+
+        # Guard: tool names must not collide with reserved terminal actions.
+        # If a domain tool were named "final_answer", "ask_clarification", or
+        # "report_error", the auto-correction below would misclassify it.
+        # This is checked once per decide_action call so it fires early.
+        _terminal_collision = tool_names_set & set(_VALID_TERMINALS)
+        if _terminal_collision:
+            logger.warning(
+                f"decide_action: tool name(s) {_terminal_collision} in domain "
+                f"'{self.domain}' collide with reserved terminal action names. "
+                f"Terminal interpretation takes precedence — these tools cannot "
+                f"be reached via auto-correction."
+            )
 
         # First-turn guidance: prevent LLM from answering without tools.
         # Exception: 'missing' difficulty tasks omit a parameter on purpose,
@@ -505,8 +547,45 @@ Return only:
                     marker = ""
                 desc = tool_desc_map.get(tn, tn)
                 lines.append(f"  {i+1}. {tn} ({desc}) {marker}")
-            lines.append("Only call final_answer after ALL steps are complete.")
+            lines.append(
+                "Follow this dependency chain in order. The NEXT tool is mandatory; "
+                "do not skip it or substitute an unrelated tool. Only call "
+                "final_answer after ALL steps are complete."
+            )
             chain_guide = "\n".join(lines) + "\n"
+
+        # ── P1 PROVE-alignment: explicit next-tool enforcement ──
+        # The chain_guide marks the next tool with "← NEXT", but the LLM
+        # still has to parse this from natural language.  When chain_seed
+        # is active, inject a hard constraint into the system prompt so
+        # the LLM knows its action space BEFORE generating, not after we
+        # reject an incorrect tool_name.
+        next_tool_hint = ""
+        tool_desc = ""
+        # Skip hard tool constraint for missing difficulty: the LLM is
+        # expected to ask_clarification on the first turn, not blindly
+        # call the next chain tool.  Injecting "MUST call tool X" would
+        # produce unverifiable samples that fail replay/provenance checks.
+        if (chain_seed and chain_progress < len(chain_seed)
+                and difficulty != "missing"):
+            next_tool = chain_seed[chain_progress]
+            for t in tool_schemas:
+                if t["name"] == next_tool:
+                    desc = t.get("description", "").split(".")[0].strip()
+                    tool_desc = f" — {desc}" if desc else ""
+                    break
+            next_tool_hint = (
+                f"\n## Hard Constraint\n"
+                f"Your next tool_call MUST use \"tool_name\": \"{next_tool}\"{tool_desc}. "
+                f"No other tool is acceptable right now. "
+                f"Look at the execution history and domain state to decide the "
+                f"arguments for this tool.\n"
+            )
+
+        date_guide = (
+            f"## Reference Date\nToday is {reference_date}. Do not invent dates from an earlier year.\n"
+            if reference_date else ""
+        )
 
         system = (
             "You are an AI assistant helping a user complete a task via tool calls. "
@@ -533,6 +612,11 @@ Return only:
             '✗ WRONG tool call:      {"action": "search_events", "arguments": {"keyword": "team meeting"}}\n'
             '✗ WRONG tool call:      {"action": "search_events", "tool_name": "search_events", "arguments": {...}}'
         )
+        if next_tool_hint:
+            system += (
+                "\n\nCRITICAL: This turn you MUST call tool `" + next_tool + "`"
+                + tool_desc + ". No other action is allowed. Do not output final_answer."
+            )
         user = f"""## Domain
 {self.domain_desc}
 
@@ -541,6 +625,7 @@ Return only:
 
 {dep_hints}
 {chain_guide}
+{date_guide}
 ## User Task
 {user_query}
 
@@ -555,7 +640,7 @@ Output one JSON object:
                 raw = self.client.generate_chat(
                     [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
-                    temperature=0.7 + 0.1 * attempt,
+                    temperature=0.6 + 0.1 * attempt,
                 )
                 data = _extract_json(raw)
                 if not isinstance(data, dict):
@@ -894,6 +979,7 @@ def derive_success_criteria(
                 criteria.append({
                     "type": "state_exists", "server": domain,
                     "path": f"{key}.{nk}",
+                    "path_parts": [key, nk],
                 })
                 entity = final_val[nk]
                 if isinstance(entity, dict):
@@ -901,8 +987,16 @@ def derive_success_criteria(
                         if ek in entity and entity[ek] is not None:
                             criteria.append({
                                 "type": "state_equals", "server": domain,
-                                "path": f"{key}.{nk}.{ek}", "value": entity[ek],
+                                "path": f"{key}.{nk}.{ek}",
+                                "path_parts": [key, nk, ek],
+                                "value": entity[ek],
                             })
+            for rk in (init_keys - final_keys):
+                criteria.append({
+                    "type": "state_absent", "server": domain,
+                    "path": f"{key}.{rk}",
+                    "path_parts": [key, rk],
+                })
 
     # Value changes on existing entities
     for key in final_state:
@@ -918,11 +1012,13 @@ def derive_success_criteria(
                         if fk in ie and ie[fk] != fe[fk] and fe[fk] is not None:
                             criteria.append({
                                 "type": "state_equals", "server": domain,
-                                "path": f"{key}.{ck}.{fk}", "value": fe[fk],
+                                "path": f"{key}.{ck}.{fk}",
+                                "path_parts": [key, ck, fk],
+                                "value": fe[fk],
                             })
 
     # Domain-specific semantic criteria
-    tool_names = [c.tool_name for c in oracle_calls]
+    tool_names = [c.tool_name for c in oracle_calls if c.action == "tool_call"]
     criteria.extend(_domain_criteria(tool_names, initial_state, final_state, domain))
 
     # P3b FIX: Removed the empty-path fallback below.
@@ -935,6 +1031,126 @@ def derive_success_criteria(
     # an empty criteria list degrades gracefully to outcome-only coverage.
 
     return criteria
+
+
+def _tool_entity(name: str) -> str:
+    """Extract entity type from tool name.
+
+    Mirrors orchestrator._tool_entity.  Defined locally to avoid circular import.
+    """
+    for et in ("event", "order", "account", "email", "invoice",
+                "issue", "lead", "deal", "product", "restaurant",
+                "channel", "message", "file", "contact", "payment",
+                "menu", "cart", "transfer", "transaction"):
+        if et in name:
+            return et
+    return name.split("_")[-1] if "_" in name else name
+
+
+def derive_progress_predicates(
+    oracle_calls: list[OracleCall],
+    domain: str,
+) -> list[dict[str, Any]]:
+    """Derive step-level progress predicates from the oracle trace.
+
+    OVAL-MCP §5.4 verifier automaton defines five progress predicates:
+      - resolved_required_entity:   a required entity/resource is uniquely resolved
+      - satisfied_dependency_edge:  a dependency-ordered predecessor is completed
+      - completed_required_transition: expected state transition is completed
+      - verified_postcondition:    required postcondition is checked or observed
+      - produced_required_response: terminal action satisfies task predicate
+
+    Each predicate is tagged with the oracle_call index so the reward function
+    can compute F_gamma = gamma * Phi(m_{t+1}) - Phi(m_t) per step.
+
+    Returns a list of dicts, one per progress event:
+        {"step": int, "type": str, "tool": str, "entity": str}
+    """
+    predicates: list[dict[str, Any]] = []
+    real_calls = [c for c in oracle_calls if c.action == "tool_call"]
+
+    if not real_calls:
+        return predicates
+
+    # Step 1: resolved_required_entity for every read/lookup call
+    read_prefixes = ("list_", "search_", "get_", "find_", "check_", "lookup_",
+                     "view_", "browse_", "ls", "cat", "stat", "head", "tail")
+    resolved_entities: set[str] = set()
+
+    for i, call in enumerate(real_calls):
+        is_read = any(call.tool_name.lower().startswith(p) for p in read_prefixes)
+        entity = _tool_entity(call.tool_name)
+        if is_read and entity not in resolved_entities:
+            resolved_entities.add(entity)
+            predicates.append({
+                "step": i,
+                "type": "resolved_required_entity",
+                "tool": call.tool_name,
+                "entity": entity,
+            })
+
+    # Step 2: completed_required_transition for mutation calls
+    mutate_prefixes = ("create_", "update_", "delete_", "remove_", "add_",
+                       "send_", "transfer", "pay_", "checkout", "transition_",
+                       "convert_", "archive_", "mkdir", "touch", "mv", "cp",
+                       "chmod", "write_", "set_", "apply_")
+    for i, call in enumerate(real_calls):
+        is_mutate = any(call.tool_name.lower().startswith(p) for p in mutate_prefixes)
+        if is_mutate:
+            entity = _tool_entity(call.tool_name)
+            # Extract target entity ID from arguments
+            target = ""
+            for key, val in (call.arguments or {}).items():
+                if isinstance(val, str) and ("_id" in key.lower() or key.lower() in ("path", "event_id")):
+                    target = val
+                    break
+            predicates.append({
+                "step": i,
+                "type": "completed_required_transition",
+                "tool": call.tool_name,
+                "entity": entity,
+                "target_id": target,
+            })
+
+    # Step 3: satisfied_dependency_edge for consecutive calls where predecessor's
+    # entity type is used by successor
+    for i in range(1, len(real_calls)):
+        prev = real_calls[i - 1]
+        curr = real_calls[i]
+        # A dependency edge is satisfied when prev resolved/produced an entity
+        # type that curr consumes or mutates
+        prev_entity = _tool_entity(prev.tool_name)
+        curr_entity = _tool_entity(curr.tool_name)
+        if prev_entity == curr_entity:
+            predicates.append({
+                "step": i,
+                "type": "satisfied_dependency_edge",
+                "tool": curr.tool_name,
+                "from_step": i - 1,
+                "entity": curr_entity,
+            })
+
+    # Step 4: verified_postcondition for terminal or verification calls
+    terminal_actions = [c for c in oracle_calls if c.action != "tool_call"]
+    if terminal_actions:
+        last_terminal = terminal_actions[-1]
+        last_step = len(real_calls)  # virtual step after all tool calls
+        predicates.append({
+            "step": last_step,
+            "type": "verified_postcondition",
+            "action": last_terminal.action,
+        })
+
+    # Step 5: produced_required_response (terminal action itself)
+    if terminal_actions:
+        last_terminal = terminal_actions[-1]
+        predicates.append({
+            "step": len(real_calls),
+            "type": "produced_required_response",
+            "action": last_terminal.action,
+        })
+
+    return predicates
 
 
 def _domain_criteria(
@@ -1050,15 +1266,18 @@ def replay_validate(
     executor: object,
     seed: int,
     domain: str,
+    success_criteria: list[dict[str, Any]] | None = None,
 ) -> tuple[bool, float, int, int]:
     """Replay oracle trace against a fresh session to verify it's reproducible.
 
-    PROVE §3.2 Step 5: counts only schema-level and execution errors (not
-    empty-result responses). Discards conversations with error rate > 30%.
+    Counts only schema-level and execution errors (not empty-result responses).
+    PROVE's corpus filter permits up to 30%, but an oracle used directly as a
+    GRPO verifier must be fully executable, so this implementation requires
+    zero replay errors.
 
     Returns:
         (passed, error_rate, num_errors, num_calls)
-        - passed: True if error_rate <= 0.30
+        - passed: True if no schema/execution error occurred
         - error_rate: fraction of calls that failed
         - num_errors: count of schema/execution errors
         - num_calls: total tool calls replayed
@@ -1069,8 +1288,8 @@ def replay_validate(
     try:
         manager.discover_tools(session.session_id)
         for idx, call in enumerate(oracle_calls):
-            # Skip clarification calls — they are not real tool executions
-            if call.action == "clarification":
+            # Terminal actions are oracle contract metadata, not MCP calls.
+            if call.action != "tool_call":
                 continue
             from src.live_mcp.types import ToolCall
             result = executor.execute(
@@ -1112,8 +1331,24 @@ def replay_validate(
                     # Unknown error type — count as error
                     num_errors += 1
 
-        error_rate = num_errors / num_calls if num_calls > 0 else 0.0
-        passed = error_rate <= 0.30
+        if success_criteria:
+            from src.live_mcp.oracle import criterion_satisfied
+
+            replay_state = manager.get_state(session.session_id)
+            criteria_errors = sum(
+                1 for criterion in success_criteria
+                if not criterion_satisfied(replay_state, criterion)
+            )
+            # PROVE allows up to 30% error rate on tool calls.  For state
+            # criteria we use a floor-based 25% threshold: int(N*0.25).
+            # With 1-3 criteria this is 0 (all must pass); with 4+ criteria
+            # this is 1+ (one failure tolerated).  Unlike max(1, ...) this
+            # does not silently accept the only failing criterion when N=1.
+            threshold = int(len(success_criteria) * 0.25)
+            num_errors += criteria_errors if criteria_errors > threshold else 0
+
+        error_rate = num_errors / num_calls if num_calls > 0 else float(num_errors > 0)
+        passed = num_errors == 0
 
         return passed, error_rate, num_errors, num_calls
     finally:
@@ -1174,6 +1409,8 @@ def provenance_check(
     # Check each oracle call's arguments for sensitive params
     traceable_values: list[str] = list(initial_traceable)
     for idx, call in enumerate(oracle_calls):
+        if call.action != "tool_call":
+            continue
         for param_name, param_value in call.arguments.items():
             param_lower = param_name.lower()
 

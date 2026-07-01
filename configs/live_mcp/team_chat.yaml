@@ -37,30 +37,91 @@ reward_profile: team_chat_basic
 
 dependency_graph:
   edges:
+    # ── Channel discovery → operations ──
     - source_tool: list_channels
       target_tool: get_channel
       relation: explicit
-      source_output_path: channel_id
+      source_output_path: channels[].channel_id
       target_argument_path: channel_id
+    - source_tool: list_channels
+      target_tool: send_message
+      relation: explicit
+      source_output_path: channels[].channel_id
+      target_argument_path: channel_id
+    - source_tool: list_channels
+      target_tool: archive_channel
+      relation: explicit
+      source_output_path: channels[].channel_id
+      target_argument_path: channel_id
+
+    # ── Channel → message operations ──
     - source_tool: get_channel
       target_tool: send_message
       relation: explicit
-      source_output_path: channel_id
+      source_output_path: channel.channel_id
       target_argument_path: channel_id
-    - source_tool: send_message
+    - source_tool: get_channel
       target_tool: create_thread
-      relation: explicit
-      source_output_path: message_id
-      target_argument_path: message_id
-    - source_tool: create_thread
-      target_tool: get_thread
-      relation: explicit
-      source_output_path: thread_id
-      target_argument_path: thread_id
+      relation: implicit
+      description: read channel then start thread
     - source_tool: get_channel
       target_tool: react_message
       relation: implicit
-      description: read message before reacting
+      description: read channel messages then react
+    - source_tool: get_channel
+      target_tool: archive_channel
+      relation: implicit
+      description: review channel before archive
+
+    # ── Message → thread → reply ──
+    - source_tool: send_message
+      target_tool: create_thread
+      relation: explicit
+      source_output_path: message.message_id
+      target_argument_path: message_id
+    - source_tool: send_message
+      target_tool: react_message
+      relation: implicit
+      description: send then react
+    - source_tool: create_thread
+      target_tool: get_thread
+      relation: explicit
+      source_output_path: thread.thread_id
+      target_argument_path: thread_id
+    - source_tool: create_thread
+      target_tool: send_message
+      relation: implicit
+      description: create thread then reply
+
+    # ── Search → navigate ──
+    - source_tool: search_messages
+      target_tool: get_channel
+      relation: implicit
+      description: find messages then view channel
+    - source_tool: search_messages
+      target_tool: send_message
+      relation: implicit
+      description: find context then respond
+
+    # ── Channel lifecycle ──
+    - source_tool: create_channel
+      target_tool: list_channels
+      relation: implicit
+      description: verify new channel visible
+    - source_tool: create_channel
+      target_tool: send_message
+      relation: implicit
+      description: create channel then post first message
+
+    # ── User → DM ──
+    - source_tool: get_user_status
+      target_tool: send_dm
+      relation: implicit
+      description: check user online before DM
+    - source_tool: list_channels
+      target_tool: get_user_status
+      relation: implicit
+      description: see members then check status
 
 query_templates:
   team_chat_send_and_thread:

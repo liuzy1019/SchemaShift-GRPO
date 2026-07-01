@@ -38,7 +38,7 @@ except ImportError:
 try:
     from transformers import pipeline  # noqa: F401
     _HAS_TRANSFORMERS = True
-except ImportError:
+except (ImportError, OSError):
     pass
 
 
@@ -264,6 +264,7 @@ class LLMClientPool:
                 args=(
                     gpu_idx, self.gpu_ids[gpu_idx], self.model_path,
                     chunk, self.temperature, self.max_tokens, result_queue,
+                    n_gpus,
                 ),
             )
             p.start()
@@ -294,6 +295,7 @@ def _gpu_worker(
     temperature: float,
     max_tokens: int,
     result_queue: mp.Queue,
+    n_gpus: int,
 ) -> None:
     """Worker function that loads model on one GPU and processes prompts."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
@@ -312,7 +314,8 @@ def _gpu_worker(
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     for i, prompt in enumerate(prompts):
-        global_idx = gpu_idx + i * len(prompts)  # approximate global index
+        # prompts are interleaved: chunk[gpu_idx][i] = all_prompts[gpu_idx + i * n_gpus]
+        global_idx = gpu_idx + i * n_gpus
         try:
             if tokenizer.chat_template:
                 formatted = tokenizer.apply_chat_template(
@@ -332,9 +335,6 @@ def _gpu_worker(
                 return_full_text=False,
             )
             text = result[0]["generated_text"]
-            # Strip <｜end▁of▁thinking｜>
-            if "<｜end▁of▁thinking｜>" in text:
-                text = text.split(" response")[-1].strip()
             logger.debug(f"[GPU {device_id}] {i}/{len(prompts)} done")
         except Exception as e:
             logger.error(f"[GPU {device_id}] Error on prompt {i}: {e}")

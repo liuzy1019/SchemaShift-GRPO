@@ -55,6 +55,19 @@ class TaskOrchestrator:
         self._domain_graphs: dict[str, dict] = {}     # cached dependency graphs per domain
         self._domain_chains: dict[str, list] = {}     # cached length-2 to length-5 chains
 
+    @staticmethod
+    def _chain_progress_for_calls(oracle_calls: list, chain_seed: list[str] | None) -> int:
+        """Compute how many chain_seed prefix steps are satisfied by oracle_calls."""
+        if not chain_seed:
+            return 0
+        progress = 0
+        for call in oracle_calls:
+            if getattr(call, "action", "tool_call") != "tool_call":
+                continue
+            if progress < len(chain_seed) and call.tool_name == chain_seed[progress]:
+                progress += 1
+        return progress
+
     def _run_turn_loop(
         self,
         teacher,
@@ -67,8 +80,13 @@ class TaskOrchestrator:
         local_rng: random.Random,
         chain_seed: list[str] | None,
         round_idx: int,
+        reference_date: str = "",
+        chain_progress_start: int = 0,
     ) -> tuple[list, list[dict], set[str]]:
         """Run one conversation round of teacher-driven tool execution.
+
+        chain_progress_start: cumulative chain_seed steps satisfied in previous
+        rounds. Used for cross-round chain enforcement (PROVE continuation).
 
         Returns (oracle_calls, execution_history, required_tools).
         """
@@ -99,15 +117,21 @@ class TaskOrchestrator:
             """Append call to oracle_calls if not duplicate / not over budget.
             Returns True if appended.
             """
-            # Hard cap on real (non-clarification) calls per task.
-            real_count = sum(1 for oc in oracle_calls if oc.action != "clarification")
-            if call.action != "clarification" and real_count >= 5:
+            # Terminal actions are part of the oracle contract but do not
+            # consume the 2-5 tool-call budget and are not deduplicated.
+            if call.action != "tool_call":
+                oracle_calls.append(call)
+                return True
+
+            # Hard cap on real tool calls per task.
+            real_count = sum(1 for oc in oracle_calls if oc.action == "tool_call")
+            if real_count >= 5:
                 return False
             # LIST-class tools (one-shot collections): dedup by name only.
             # get_/search_/find_ are entity reads — different entities are
             # legitimate, so they fall through to (name,args) dedup below.
             tname = call.tool_name or ""
-            if call.action != "clarification" and tname.startswith("list_"):
+            if tname.startswith("list_"):
                 if tname in seen_read_tools:
                     return False
                 seen_read_tools.add(tname)
@@ -132,11 +156,25 @@ class TaskOrchestrator:
         # 6-9 length chains for greedy LLMs.
         MAX_ORACLE_CALLS_PER_TASK = 5
 
-        for turn in range(max_turns):
-            chain_progress = len({oc.tool_name for oc in oracle_calls if oc.action != "clarification"})
+        MAX_CHAIN_REJECTS = 3
+        remaining_chain_rejects = MAX_CHAIN_REJECTS
+        attempt = 0          # raw LLM call count (for temperature scaling)
+        _turn: int = 0       # real turn count (tool exec + terminal)
+        while _turn < max_turns:
+            # Progress means satisfying the seeded dependency chain in order,
+            # not merely calling the same number of arbitrary unique tools.
+            chain_progress = chain_progress_start
+            if chain_seed and chain_progress < len(chain_seed):
+                for previous in oracle_calls:
+                    if previous.action != "tool_call":
+                        continue
+                    if chain_progress < len(chain_seed) and previous.tool_name == chain_seed[chain_progress]:
+                        chain_progress += 1
+            elif not chain_seed:
+                chain_progress = chain_progress_start + sum(1 for oc in oracle_calls if oc.action == "tool_call")
 
             # BUG-2 hard cap: stop emitting new oracle entries once we hit 5.
-            real_oracle_count = sum(1 for oc in oracle_calls if oc.action != "clarification")
+            real_oracle_count = sum(1 for oc in oracle_calls if oc.action == "tool_call")
             if real_oracle_count >= MAX_ORACLE_CALLS_PER_TASK:
                 break
 
@@ -144,27 +182,29 @@ class TaskOrchestrator:
                 tool_schemas=server_tools,
                 user_query=current_query,
                 execution_history=execution_history,
-                attempt=turn,
+                attempt=attempt,
                 dep_hints=dep_hints,
                 difficulty=difficulty,
                 chain_seed=chain_seed if round_idx == 0 else None,
                 chain_progress=chain_progress,
+                reference_date=reference_date,
             )
 
             if action.action == "ask_clarification":
-                if difficulty == "missing":
-                    _add_oracle(OracleCall(
-                        tool_name="ask_clarification",
-                        arguments={"question": action.text},
-                        action="clarification",
-                    ))
+                _add_oracle(OracleCall(
+                    tool_name="ask_clarification",
+                    arguments={"question": action.text},
+                    action="ask_clarification",
+                ))
                 break
 
             if action.action in ("final_answer", "report_error"):
                 if (round_idx == 0 and chain_seed and len(chain_seed) >= 2
                         and chain_progress < len(chain_seed)
-                        and turn < max_turns - 1):
+                        and remaining_chain_rejects > 0):
                     remaining = chain_seed[chain_progress:]
+                    remaining_chain_rejects -= 1
+                    attempt += 1
                     execution_history.append({
                         "tool_name": "__reject__",
                         "arguments": {},
@@ -178,6 +218,11 @@ class TaskOrchestrator:
                         "success": False,
                     })
                     continue
+                _add_oracle(OracleCall(
+                    tool_name=action.action,
+                    arguments={"text": action.text},
+                    action=action.action,
+                ))
                 break
 
             if action.action != "tool_call" or not action.tool_name:
@@ -185,16 +230,58 @@ class TaskOrchestrator:
 
             tool_name = action.tool_name
             tool_name = _fuzzy_match_tool(tool_name, {t["name"] for t in server_tools}) or tool_name
+
+            # The dependency seed is the executable task specification.  A
+            # teacher deviation would create a fluent but unverifiable trace;
+            # reject it and ask for the mandatory next tool instead.
+            if chain_seed and chain_progress < len(chain_seed):
+                expected_tool = chain_seed[chain_progress]
+                # P1-3: missing-difficulty tasks are designed to surface
+                # under-specified queries; the LLM may legitimately choose
+                # ask_clarification instead of the next chain tool.  Skip
+                # chain enforcement so the natural clarification path can
+                # produce valid samples.
+                if tool_name != expected_tool and difficulty != "missing":
+                    if remaining_chain_rejects > 0:
+                        remaining_chain_rejects -= 1
+                        attempt += 1
+                        execution_history.append({
+                            "tool_name": "__reject__",
+                            "arguments": {},
+                            "observation": {
+                                "error": f"Expected next dependency tool: {expected_tool}."
+                            },
+                            "success": False,
+                        })
+                        continue
+                    # No reject budget left — accept the deviation and execute.
+            if _has_stale_year(action.arguments, reference_date):
+                execution_history.append({
+                    "tool_name": "__reject__",
+                    "arguments": dict(action.arguments),
+                    "observation": {
+                        "error": f"Arguments use a year earlier than the reference date {reference_date}."
+                    },
+                    "success": False,
+                })
+                _turn += 1
+                attempt += 1
+                continue
             required_tools.add(tool_name)
 
             result = self.executor.execute(
                 session_id,
-                ToolCall(tool_name, dict(action.arguments), call_id=f"sm_{turn}"),
+                ToolCall(tool_name, dict(action.arguments), call_id=f"sm_{_turn}"),
                 domain=server_name,
             )
 
-            perturbed_obs = apply_perturbation(
-                result.observation, server_name, local_rng,
+            # Observation perturbations are safe only for read-only calls.
+            # Applying a synthetic "retry" after a successful mutation leaves
+            # an unrecorded state change that replay can never reproduce.
+            perturbed_obs = (
+                apply_perturbation(result.observation, server_name, local_rng)
+                if result.success and not result.state_changed
+                else None
             )
 
             if isinstance(perturbed_obs, dict) and perturbed_obs.get("retry"):
@@ -206,6 +293,8 @@ class TaskOrchestrator:
                 })
                 # Retry triggered: don't add failed call to oracle.
                 # If the next turn succeeds, the success path will add it once.
+                _turn += 1
+                attempt += 1
                 continue
 
             if not result.success:
@@ -231,7 +320,7 @@ class TaskOrchestrator:
                     corrected = recovery.get("corrected_args", dict(action.arguments))
                     retry_result = self.executor.execute(
                         session_id,
-                        ToolCall(tool_name, corrected, call_id=f"sm_recover_{turn}"),
+                        ToolCall(tool_name, corrected, call_id=f"sm_recover_{_turn}"),
                         domain=server_name,
                     )
                     if retry_result.success:
@@ -250,7 +339,7 @@ class TaskOrchestrator:
                     if alt_tool and alt_tool in {t["name"] for t in server_tools}:
                         alt_result = self.executor.execute(
                             session_id,
-                            ToolCall(alt_tool, recovery.get("arguments", {}), call_id=f"sm_alt_{turn}"),
+                            ToolCall(alt_tool, recovery.get("arguments", {}), call_id=f"sm_alt_{_turn}"),
                             domain=server_name,
                         )
                         if alt_result.success:
@@ -265,6 +354,8 @@ class TaskOrchestrator:
                                 tool_name=alt_tool,
                                 arguments=recovery.get("arguments", {}),
                             ))
+                _turn += 1
+                attempt += 1
                 continue
 
             obs_to_record = perturbed_obs if perturbed_obs is not None else result.observation
@@ -280,11 +371,26 @@ class TaskOrchestrator:
                 arguments=dict(action.arguments),
             ))
 
+            _turn += 1
+            attempt += 1
+
             if not ContinuationPolicy.should_continue(
-                turn, target_turns, result.success,
-                sum(1 for oc in oracle_calls if oc.action != "clarification"),
+                _turn, target_turns, result.success,
+                sum(1 for oc in oracle_calls if oc.action == "tool_call"),
             ):
                 break
+
+        # A successful tool trace always has an explicit terminal contract.
+        # This also covers turn-decay / budget exits where the teacher did not
+        # get another generation turn to emit final_answer.
+        if (any(oc.action == "tool_call" for oc in oracle_calls)
+                and not any(oc.action in ("final_answer", "report_error", "ask_clarification")
+                            for oc in oracle_calls)):
+            _add_oracle(OracleCall(
+                tool_name="final_answer",
+                arguments={"text": "Task completed."},
+                action="final_answer",
+            ))
 
         return oracle_calls, execution_history, required_tools
 
@@ -307,7 +413,8 @@ class TaskOrchestrator:
         Retries with different seed if oracle_calls is empty or replay fails.
         """
         from src.live_mcp.task_planner import (
-            TaskPlanner, derive_success_criteria, replay_validate, apply_perturbation,
+            TaskPlanner, derive_success_criteria, derive_progress_predicates,
+            replay_validate, apply_perturbation,
             _PERSONA_TEMPLATES, _REFERENCE_DATES, ContinuationPolicy,
             provenance_check,
         )
@@ -320,9 +427,12 @@ class TaskOrchestrator:
         reference_date = _REFERENCE_DATES[(seed // len(_PERSONA_TEMPLATES)) % len(_REFERENCE_DATES)]
 
         # ── Sample dependency chain seed (PROVE §6 step 2) ──
-        chains = self._get_chains(server_name)
+        chains = self._get_quality_chains(server_name) or self._get_chains(server_name)
         chain_seed: list[str] | None = None
-        if chains and rng.random() < 0.80:  # 80% of tasks have a chain seed
+        if chains:
+            # Tool-required rows are deliberately multi-step.  Sampling a
+            # dependency seed for every such row prevents single-call tasks
+            # from dominating the GRPO signal.
             chain_seed = rng.choice(chains)
 
         # ── Conversation-level continuation (PROVE §3.2 Step 3.5) ──
@@ -383,6 +493,7 @@ class TaskOrchestrator:
                         )
                         grounded_state_update = self.manager.get_state(session_id)
                         domain_state_update = grounded_state_update.get(server_name, {})
+                        followup_chain_progress = self._chain_progress_for_calls(all_oracle_calls, chain_seed)
                         current_query = teacher.generate_followup(
                             tool_schemas=server_tools,
                             grounded_state=domain_state_update,
@@ -392,9 +503,12 @@ class TaskOrchestrator:
                             rng=local_rng,
                             persona=persona,
                             reference_date=reference_date,
+                            chain_seed=chain_seed,
+                            chain_progress=followup_chain_progress,
                         )
                         conversation_queries.append(current_query)
 
+                    current_chain_progress = self._chain_progress_for_calls(all_oracle_calls, chain_seed)
                     round_ocs, round_hist, round_reqs = self._run_turn_loop(
                         teacher=teacher,
                         current_query=current_query,
@@ -406,11 +520,13 @@ class TaskOrchestrator:
                         local_rng=local_rng,
                         chain_seed=chain_seed,
                         round_idx=round_idx,
+                        reference_date=reference_date,
+                        chain_progress_start=current_chain_progress,
                     )
 
                     if round_idx == 0:
-                        _real_round = [c for c in round_ocs if getattr(c, "action", "tool_call") != "clarification"]
-                        _clar_round = [c for c in round_ocs if getattr(c, "action", "tool_call") == "clarification"]
+                        _real_round = [c for c in round_ocs if getattr(c, "action", "tool_call") == "tool_call"]
+                        _clar_round = [c for c in round_ocs if getattr(c, "action", "tool_call") == "ask_clarification"]
                         if not _real_round and not (difficulty == "missing" and _clar_round):
                             if retry_attempt < 2:
                                 logger.debug(
@@ -428,8 +544,13 @@ class TaskOrchestrator:
                     # but seen_read_tools / seen_oracle_keys reset between
                     # rounds, so a 4-round task can still emit list_invoices
                     # 4 times.  Apply the same rules globally here.
+                    #
+                    # P1-13 fix: reserve the last round's calls for ground truth.
+                    # Previous rounds get the 5-call cap (they appear in prompt),
+                    # but zeroing the last round destroys the training signal
+                    # because ground truth = last round only.
                     global_seen_read = {oc.tool_name for oc in all_oracle_calls
-                                        if getattr(oc, "action", "tool_call") != "clarification"
+                                        if getattr(oc, "action", "tool_call") == "tool_call"
                                         and (oc.tool_name or "").startswith("list_")}
                     global_seen_keys = set()
                     for _oc in all_oracle_calls:
@@ -439,14 +560,18 @@ class TaskOrchestrator:
                             _args_repr = repr(_oc.arguments)
                         global_seen_keys.add((_oc.tool_name, _args_repr))
 
-                    real_so_far = sum(1 for oc in all_oracle_calls if getattr(oc, "action", "tool_call") != "clarification")
+                    is_last_round = (round_idx == conversation_rounds - 1)
+                    real_so_far = sum(1 for oc in all_oracle_calls if getattr(oc, "action", "tool_call") == "tool_call")
                     filtered_round_ocs = []
                     for oc in round_ocs:
                         action = getattr(oc, "action", "tool_call")
-                        if action == "clarification":
+                        if action != "tool_call":
                             filtered_round_ocs.append(oc)
                             continue
-                        if real_so_far >= 5:
+                        if not is_last_round and real_so_far >= 5:
+                            break
+                        if is_last_round and real_so_far >= 5:
+                            # PROVE hard cap: oracle chain ≤ 5 across ALL rounds.
                             break
                         tname = oc.tool_name or ""
                         if tname.startswith("list_"):
@@ -471,8 +596,8 @@ class TaskOrchestrator:
                     execution_history_per_round.append(list(round_hist))
 
                 # If we broke out of conversation loop early (first round failed)
-                _real_now = [c for c in all_oracle_calls if getattr(c, "action", "tool_call") != "clarification"]
-                _clar_now = [c for c in all_oracle_calls if getattr(c, "action", "tool_call") == "clarification"]
+                _real_now = [c for c in all_oracle_calls if getattr(c, "action", "tool_call") == "tool_call"]
+                _clar_now = [c for c in all_oracle_calls if getattr(c, "action", "tool_call") == "ask_clarification"]
                 if not _real_now and not (difficulty == "missing" and _clar_now):
                     self.manager.close_session(session_id)
                     continue  # retry loop
@@ -486,14 +611,19 @@ class TaskOrchestrator:
                     oracle_calls=all_oracle_calls,
                     domain=server_name,
                 )
+                progress_predicates = derive_progress_predicates(
+                    oracle_calls=all_oracle_calls,
+                    domain=server_name,
+                )
 
-                # ── Replay validate (PROVE §3.2 Step 5: ≤30% error rate) ──
+                # ── Replay validate (training oracle: zero errors + criteria) ──
                 valid, error_rate, num_errors, num_calls = replay_validate(
                     oracle_calls=all_oracle_calls,
                     manager=self.manager,
                     executor=self.executor,
                     seed=local_seed,
                     domain=server_name,
+                    success_criteria=success_criteria,
                 )
                 if not valid:
                     if retry_attempt < 2:
@@ -547,23 +677,36 @@ class TaskOrchestrator:
         # (PROVE missing-required information level). If the oracle has at
         # least one ask_clarification, that's a valid task — don't raise.
         real_calls = [c for c in all_oracle_calls
-                      if getattr(c, "action", "tool_call") != "clarification"]
+                      if getattr(c, "action", "tool_call") == "tool_call"]
         clarification_calls = [c for c in all_oracle_calls
-                               if getattr(c, "action", "tool_call") == "clarification"]
+                               if getattr(c, "action", "tool_call") == "ask_clarification"]
         if not real_calls and not (difficulty == "missing" and clarification_calls):
             raise RuntimeError(
                 f"No real tool_call recorded for {server_name} task {task_id} "
                 f"after 3 retries (LLM only produced clarifications/refusals)"
             )
+        if real_calls and not (2 <= len(real_calls) <= 5):
+            raise RuntimeError(
+                f"Oracle chain length {len(real_calls)} outside required 2-5 "
+                f"for {server_name} task {task_id}"
+            )
+        if chain_seed and real_calls:
+            realized_prefix = [call.tool_name for call in real_calls[:len(chain_seed)]]
+            if realized_prefix != chain_seed:
+                raise RuntimeError(
+                    f"Dependency chain incomplete for {server_name} task {task_id}: "
+                    f"expected {chain_seed}, got {realized_prefix}"
+                )
 
         # ── Build final task ──
         oracle_program = OracleProgram(
             task_id=task_id,
             calls=all_oracle_calls,
             success_criteria=success_criteria,
+            progress_predicates=progress_predicates,
         )
 
-        return self._to_live_task(
+        live_task = self._to_live_task(
             server_name=server_name, query=user_query,
             session_id=session_id, seed=local_seed,
             all_tools=all_tools, oracle_program=oracle_program,
@@ -573,6 +716,37 @@ class TaskOrchestrator:
             oracle_calls_per_round=oracle_calls_per_round,
             execution_history_per_round=execution_history_per_round,
         )
+        target_ids = _oracle_target_ids(real_calls)
+        identity_policy = _identity_policy_for_domain(server_name)
+        deleted_targets = _oracle_deleted_target_ids(real_calls)
+        protected_fields_by_resource = _protected_fields_by_resource(
+            initial_state_snapshot, target_ids, success_criteria
+        )
+        terminal_action = next(
+            (c.action for c in reversed(all_oracle_calls) if c.action != "tool_call"),
+            "final_answer",
+        )
+        scenario_type = _classify_scenario(
+            server_name=server_name,
+            oracle_calls=real_calls,
+            execution_history=all_execution_history,
+            terminal_action=terminal_action,
+            seed=local_seed,
+        )
+        live_task.metadata.update({
+            "initial_state_hash": _stable_state_hash(initial_state_snapshot),
+            "identity_policy": identity_policy,
+            "target_resource_ids": target_ids,
+            "protected_resources": (
+                sorted(set(target_ids) - set(deleted_targets))
+                if identity_policy == "preserve" else []
+            ),
+            "protected_fields_by_resource": protected_fields_by_resource,
+            "scenario_type": scenario_type,
+            "terminal_action": terminal_action,
+            "strip_enums": bool(getattr(teacher, "_strip_enums", False)),
+        })
+        return live_task
 
     def generate_many(self, server_name: str, count: int, seed: int,
                       difficulty_mix: dict[str, float] | None = None,
@@ -626,7 +800,10 @@ class TaskOrchestrator:
             domain_target = per_domain + (1 if si < remainder else 0)
             domain_ok = 0
             domain_failed = 0
-            max_domain_failures = max(domain_target * 2, 5)
+            # Strict 2-5 chain and replay gates intentionally reject fluent but
+            # unverifiable teacher traces; allow enough attempts to replenish
+            # the requested domain quota instead of silently under-yielding.
+            max_domain_failures = max(domain_target * 4, 10)
 
             for _attempt in range(domain_target + max_domain_failures):
                 if domain_ok >= domain_target:
@@ -685,7 +862,7 @@ class TaskOrchestrator:
             pbar.close()
 
         # ── irrelevance tasks (5%) ──
-        irr = self._generate_irrelevant_tasks(n_irrelevant, seed + 9999)
+        irr = self._generate_irrelevant_tasks(n_irrelevant, seed + 9999, servers)
         tasks.extend(irr)
 
         # ── dedup across all generated tasks ──
@@ -772,8 +949,12 @@ class TaskOrchestrator:
         # has all the lookup tools to inspect state but cannot complete the
         # action, so the correct behavior is report_error with a clear reason.
         oracle_calls = getattr(task.oracle_program, "calls", None) or []
-        if oracle_calls:
-            hidden = oracle_calls[-1].tool_name
+        tool_oracle_calls = [
+            call for call in oracle_calls
+            if getattr(call, "action", "tool_call") == "tool_call"
+        ]
+        if tool_oracle_calls:
+            hidden = tool_oracle_calls[-1].tool_name
         else:
             # Fallback: oracle empty (shouldn't happen for non-irrelevant tasks),
             # use last required tool which preserves prior behavior.
@@ -804,14 +985,19 @@ class TaskOrchestrator:
                 task.metadata["has_distractors"] = True
                 task.metadata["distractor_count"] = len(selected)
 
-        task.required_tools = [n for n in task.required_tools if n != hidden]
+        task.required_tools = []
         task.success_criteria = [missing]
         task.expected_outcome = {"success_criteria": [missing], "abstain": True}
-        task.oracle_program.calls = []
+        task.oracle_program.calls = [OracleCall(
+            tool_name="report_error",
+            arguments={"text": f"Required tool '{hidden}' is unavailable."},
+            action="report_error",
+        )]
         task.oracle_program.success_criteria = [missing]
         task.task_type = "missing_function"
         task.metadata["has_missing_function"] = True
         task.metadata["unavailable_required_tool"] = hidden
+        task.metadata["scenario_type"] = "no_tool_or_abstention"
 
         # BUG-1 fix (PROVE alignment): missing_function semantics demand the
         # model abstain (report_error) without invoking tools.  However the
@@ -829,7 +1015,12 @@ class TaskOrchestrator:
             task.conversation_queries = [task.conversation_queries[0]]
         # user_prompt already holds the first query; nothing to change there.
 
-    def _generate_irrelevant_tasks(self, n: int, seed: int) -> list[LiveTask]:
+    def _generate_irrelevant_tasks(
+        self,
+        n: int,
+        seed: int,
+        allowed_servers: list[str] | None = None,
+    ) -> list[LiveTask]:
         """Generate tasks whose query is unrelated to any available tool.
 
         The expected model behavior is to ``report_error`` (cannot be done).
@@ -841,8 +1032,12 @@ class TaskOrchestrator:
         rng = random.Random(seed)
         tasks: list[LiveTask] = []
 
+        servers = allowed_servers or self.manager.server_names
+        if not servers:
+            raise ValueError("irrelevant task generation requires at least one server")
+
         for i in range(n):
-            server_name = rng.choice(self.manager.server_names)
+            server_name = rng.choice(servers)
             task_id = f"{server_name}_irrelevant_{seed}_{i}"
 
             # Ask teacher for an impossible query using a modified prompt
@@ -864,7 +1059,13 @@ class TaskOrchestrator:
                 expected_outcome={"abstain": True},
                 success_criteria=[missing],
                 oracle_program=OracleProgram(
-                    task_id=task_id, calls=[], success_criteria=[missing],
+                    task_id=task_id,
+                    calls=[OracleCall(
+                        tool_name="report_error",
+                        arguments={"text": "No available tool can satisfy this request."},
+                        action="report_error",
+                    )],
+                    success_criteria=[missing],
                 ),
                 sampling_context={},
                 max_turns=int(self.suite_config.rollout.get("max_turns", 8)),
@@ -873,6 +1074,7 @@ class TaskOrchestrator:
                 metadata={
                     "generation_method": "irrelevant_template",
                     "irrelevant": True,
+                    "scenario_type": "no_tool_or_abstention",
                 },
             )
             tasks.append(task)
@@ -1283,12 +1485,343 @@ class TaskOrchestrator:
             self._domain_chains[server_name] = self._extract_dependency_chains(server_name)
         return self._domain_chains[server_name]
 
+    def _get_quality_chains(self, server_name: str) -> list[list[str]]:
+        """Extract 2-5 step chains from reviewed YAML dependency edges.
+
+        Live-probed graphs remain useful for coverage discovery, but their
+        heuristic implicit edges are too permissive to serve as mandatory
+        teacher chains.  YAML edges encode executable domain workflows.
+
+        Chains shorter than 3 steps are dropped when longer alternatives exist:
+        2-step chains (e.g., [checkout, get_order] with an empty cart) are fragile —
+        a single replay error gives 50% error rate, and the LLM often needs pre-steps
+        the chain seed didn't encode (e.g., add_to_cart before checkout).
+        """
+        cfg = next(
+            (item for item in self.suite_config.servers if item.name == server_name),
+            None,
+        )
+        if cfg is None:
+            return []
+        graph: dict[str, list[str]] = {}
+        for edge in cfg.dependency_graph.get("edges", []) or []:
+            source = edge.get("source_tool")
+            target = edge.get("target_tool")
+            if source and target:
+                graph.setdefault(source, []).append(target)
+        chains: list[list[str]] = []
+
+        def walk(node: str, path: list[str]) -> None:
+            if len(path) >= 5:
+                return
+            for nxt in graph.get(node, []):
+                if nxt in path:
+                    continue
+                new_path = path + [nxt]
+                chains.append(new_path)
+                walk(nxt, new_path)
+
+        for start in sorted(graph):
+            walk(start, [start])
+
+        # Return all chains regardless of length.  2-step chains are valid under
+        # PROVE (2-5 range) and are far more likely to succeed during LLM teacher
+        # generation than 5-step chains, which currently account for the majority
+        # of dependency-chain-incomplete failures.
+        return chains
+
     def _get_graph_hints(self, server_name: str) -> str:
         """Return cached dependency hints for *server_name*, probing if needed."""
         if server_name not in self._domain_graphs:
             graph = self._probe_dependency_graph(server_name)
             self._domain_graphs[server_name] = graph
         return _format_graph_hints(self._domain_graphs[server_name])
+
+
+def _stable_state_hash(state: dict[str, Any]) -> str:
+    import hashlib
+
+    raw = json.dumps(state, sort_keys=True, ensure_ascii=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _has_stale_year(arguments: dict[str, Any], reference_date: str) -> bool:
+    import re
+
+    match = re.search(r"\b(20\d{2})\b", reference_date or "")
+    if not match:
+        return False
+    reference_year = int(match.group(1))
+    raw = json.dumps(arguments, ensure_ascii=False, default=str)
+    return any(int(year) < reference_year for year in re.findall(r"\b(20\d{2})[-/]", raw))
+
+
+def _identity_policy_for_domain(domain: str) -> str:
+    return {
+        "calendar": "preserve",
+        "banking": "preserve",
+        "payments": "preserve",
+        "crm": "preserve",
+        "issue_tracker": "preserve",
+        "email": "append_only",
+        "team_chat": "append_only",
+        "shopping": "create_new",
+        "food_delivery": "create_new",
+        "filesystem": "domain_defined",
+    }.get(domain, "domain_defined")
+
+
+def _oracle_target_ids(calls: list[OracleCall]) -> list[str]:
+    ids: set[str] = set()
+    for call in calls:
+        for key, value in (call.arguments or {}).items():
+            key_lower = key.lower()
+            if not (
+                key_lower.endswith("_id")
+                or key_lower in (
+                    "path", "source", "destination", "from_account", "to_account"
+                )
+            ):
+                continue
+            if isinstance(value, str) and value:
+                ids.add(value)
+    return sorted(ids)
+
+
+def _oracle_deleted_target_ids(calls: list[OracleCall]) -> list[str]:
+    delete_prefixes = ("delete_", "remove_", "cancel_", "clear_", "archive_", "rm")
+    ids: set[str] = set()
+    for call in calls:
+        if not call.tool_name.lower().startswith(delete_prefixes):
+            continue
+        ids.update(_oracle_target_ids([call]))
+    return sorted(ids)
+
+
+def _protected_fields_by_resource(
+    initial_state: dict[str, Any],
+    target_ids: list[str],
+    success_criteria: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    intended: dict[str, set[str]] = {resource_id: set() for resource_id in target_ids}
+    for criterion in success_criteria:
+        path = str(criterion.get("path", ""))
+        path_parts = criterion.get("path_parts")
+        parts = path_parts if isinstance(path_parts, list) else path.split(".")
+        for resource_id in target_ids:
+            if resource_id in parts and len(parts) > parts.index(resource_id) + 1:
+                intended[resource_id].add(parts[-1])
+
+    protected: dict[str, list[str]] = {}
+    for container in initial_state.values():
+        if not isinstance(container, dict):
+            continue
+        for resource_id in target_ids:
+            entity = container.get(resource_id)
+            if not isinstance(entity, dict):
+                continue
+            fields = {
+                field for field in entity
+                if not field.endswith("_id") and field not in intended[resource_id]
+            }
+            if fields:
+                protected[resource_id] = sorted(fields)
+    return protected
+
+
+_UNSAFE_SHORTCUT_TOOLS: dict[str, set[str]] = {
+    "calendar": {"update_event", "delete_event", "create_event"},
+    "banking": {"transfer", "wire_transfer", "bill_pay"},
+    "filesystem": {"mv", "cp", "rm", "chmod", "chown"},
+    "payments": {"pay_invoice", "refund_invoice", "cancel_payment"},
+    "shopping": {"checkout", "return_order", "clear_cart"},
+    "email": {"send_email", "reply_email", "forward_email"},
+    "team_chat": {"send_message", "send_dm", "archive_channel"},
+    "crm": {"convert_lead", "update_deal", "update_lead"},
+    "issue_tracker": {"transition_issue", "update_issue", "assign_issue"},
+    "food_delivery": {"create_order", "cancel_order", "update_order_status"},
+}
+
+
+def _classify_scenario(
+    server_name: str,
+    oracle_calls: list[OracleCall],
+    execution_history: list[dict[str, Any]],
+    terminal_action: str,
+    seed: int,
+) -> str:
+    """Classify scenario based on actual trajectory behavior, not random assignment.
+
+    OVAL-MCP §11.5: scenario_type must reflect the real trajectory, not a
+    statistical label injection.  Random assignment (old: 30% unsafe_temptation,
+    45% missing_dependency) produces mislabeled training data that pollutes the
+    reward signal.
+
+    Detection rules (ordered, first match wins):
+      1. clarification_required: terminal is ask_clarification, zero real calls
+      2. tool_error_recovery:   any non-reject execution failure in history
+      3. unsafe_temptation:     oracle trace has delete+create duplicate pattern
+                                on the same entity type (true unsafe shortcut)
+      4. missing_dependency:    2+ step oracle where a later tool needs an entity
+                                that should have been produced by an earlier step
+                                but its predecessor is absent
+      5. normal_safe_success:   everything else
+    """
+    real_calls_only = [c for c in oracle_calls
+                       if getattr(c, "action", "tool_call") == "tool_call"]
+
+    if terminal_action == "ask_clarification" and not real_calls_only:
+        return "clarification_required"
+
+    if any(not step.get("success", True) and step.get("tool_name") != "__reject__"
+           for step in execution_history):
+        return "tool_error_recovery"
+
+    if not real_calls_only:
+        return "normal_safe_success"
+
+    # ── Trajectory-based unsafe_temptation detection ──
+    if _detect_duplicate_side_effect(real_calls_only):
+        return "unsafe_temptation"
+
+    # ── Trajectory-based missing_dependency detection ──
+    # _detect_missing_dependency internally exempts creators (create_*/mkdir/touch)
+    # and self-contained tools (send_email, deposit, etc.).  Single-step traces
+    # like [update_event] with no preceding read ARE missing a dependency.
+    if _detect_missing_dependency(real_calls_only, server_name):
+        return "missing_dependency"
+
+    return "normal_safe_success"
+
+
+def _detect_duplicate_side_effect(oracle_calls: list[OracleCall]) -> bool:
+    """Detect delete+create duplicate pattern (PROVE unsafe shortcut).
+
+    Pattern: the oracle trace deletes/removes/cancels a *specific* entity and
+    then creates/adds a similar entity — functionally a "recreate" shortcut
+    that destroys identity.  This is the canonical unsafe_temptation in
+    OVAL-MCP §11.5.
+
+    Does NOT flag:
+      - rm (filesystem: path-based, no entity type)
+      - clear_* (bulk operation, legitimate state reset)
+      - remove_from_cart + add_to_cart (different items, legitimate)
+    """
+    # Entity-specific delete prefixes only; rm and clear_ are excluded because
+    # rm targets a path (entity="" matches everything), and clear_* is a bulk
+    # reset that's always legitimate when followed by new items.
+    delete_prefixes = ("delete_", "remove_", "cancel_", "archive_")
+    create_prefixes = ("create_", "add_", "mkdir", "touch", "send_")
+
+    deleted_entity_types: set[str] = set()
+    for call in oracle_calls:
+        name = call.tool_name.lower()
+        for prefix in delete_prefixes:
+            if name.startswith(prefix):
+                entity = name[len(prefix):].lstrip("_")
+                if entity:
+                    deleted_entity_types.add(entity)
+                break
+
+    if not deleted_entity_types:
+        return False
+
+    found_delete = False
+    for call in oracle_calls:
+        name = call.tool_name.lower()
+        is_delete = any(name.startswith(p) for p in delete_prefixes)
+        if is_delete:
+            found_delete = True
+            continue
+        if not found_delete:
+            continue
+        is_create = any(name.startswith(p) for p in create_prefixes)
+        if not is_create:
+            continue
+        # Exact entity match: delete_event → create_event (both entity="event").
+        # "add_to_cart" after "remove_from_cart" would match via entity="from_cart"
+        # vs entity="to_cart" → NOT equal.  Only flag when the tool entity
+        # *suffix* (not prefix substring) matches.
+        create_entity = _tool_entity(name)
+        if create_entity in deleted_entity_types:
+            return True
+
+    return False
+
+
+def _detect_missing_dependency(
+    oracle_calls: list[OracleCall],
+    server_name: str,
+) -> bool:
+    """Detect if the oracle trace skips a dependency step.
+
+    A dependency is missing when a write/mutate tool is called on an entity
+    without a preceding read OR create tool that resolves/produces that
+    entity's identity.  Create tools themselves are exempt — they produce
+    new entities and don't need preceding reads.
+
+    Also exempted: standalone creators (mkdir, touch) and tools that operate
+    on their own domain (apply_loan: self-contained account operation,
+    send_email: compose new message, etc.).
+    """
+    read_prefixes = ("list_", "search_", "get_", "find_", "lookup_", "check_",
+                     "view_", "browse_", "ls", "cat", "pwd", "stat", "head", "tail")
+    # Tools that produce entities without needing a preceding read.
+    creator_prefixes = ("create_", "mkdir", "touch")
+    # Tools in executor set that are self-contained (don't need preceding reads).
+    self_contained = {"send_email", "send_message", "send_dm", "apply_loan",
+                      "apply_coupon", "bill_pay", "deposit", "withdraw",
+                      "create_filter", "create_webhook", "set_reminder"}
+
+    executor_tools = _UNSAFE_SHORTCUT_TOOLS.get(server_name, set())
+
+    for i, call in enumerate(oracle_calls):
+        if call.tool_name not in executor_tools:
+            continue
+        # Self-contained tools and creators don't need preceding reads.
+        if call.tool_name in self_contained:
+            continue
+        if any(call.tool_name.lower().startswith(p) for p in creator_prefixes):
+            continue
+
+        has_preceding = False
+        entity = _tool_entity(call.tool_name)
+        for prev in oracle_calls[:i]:
+            if prev.tool_name == call.tool_name:
+                continue
+            prev_entity = _tool_entity(prev.tool_name)
+            prev_is_read = any(prev.tool_name.lower().startswith(p) for p in read_prefixes)
+            prev_is_creator = any(prev.tool_name.lower().startswith(p) for p in creator_prefixes)
+            if (prev_is_read or prev_is_creator):
+                if prev_entity == entity:
+                    has_preceding = True
+                    break
+                # Filesystem: path-based tools share implicit entity 'file'.
+                # ls/cat/stat discover paths; chmod/mv/cp/rm mutate them.
+                # Entity extraction returns tool-name for both, so check
+                # for filesystem-native tools explicitly.
+                if (server_name == "filesystem" and prev_is_read
+                        and not _has_entity_keyword(prev.tool_name)
+                        and not _has_entity_keyword(call.tool_name)):
+                    has_preceding = True
+                    break
+        if not has_preceding:
+            return True
+
+    return False
+
+
+def _has_entity_keyword(name: str) -> bool:
+    """Check if tool name contains any known entity keyword."""
+    for et in ("event", "order", "account", "email", "invoice",
+                "issue", "lead", "deal", "product", "restaurant",
+                "channel", "message", "file", "contact", "payment",
+                "menu", "cart", "transfer", "transaction"):
+        if et in name:
+            return True
+    return False
+
+    return False
 
 
 def _minimal_args(tool_schema: dict) -> dict[str, Any]:

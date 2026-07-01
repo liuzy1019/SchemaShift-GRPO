@@ -95,6 +95,73 @@ class DomainAdapter(ABC):
             return domain_state
         return state
 
+    def tool_semantics(
+        self,
+        tool_name: str,
+        default_target_type: str,
+        state_changed: bool = False,
+    ) -> tuple[str, str]:
+        """Classify every discovered tool, including tools absent from TOOL_MAP.
+
+        Explicit per-domain mappings win.  Naming conventions plus the live
+        state_changed bit provide a complete fallback for the 188-tool surface.
+        """
+        explicit = getattr(self, "TOOL_MAP", {}).get(tool_name)
+        if explicit:
+            return explicit
+        name = tool_name.lower()
+        query_prefixes = (
+            "get_", "list_", "search_", "check_", "find_", "read_",
+            "show_", "compare_", "track_", "export_",
+        )
+        delete_prefixes = (
+            "delete_", "remove_", "cancel_", "clear_", "archive_", "rm",
+        )
+        create_prefixes = (
+            "create_", "add_", "send_", "reply_", "forward_", "mkdir",
+            "touch", "cp", "zip", "tar_create",
+        )
+        update_prefixes = (
+            "update_", "set_", "change_", "edit_", "assign_", "apply_",
+            "move_", "mark_", "react_", "respond_", "transition_", "mv",
+            "chmod", "chown", "sed", "truncate", "transfer", "wire_transfer",
+            "bill_pay", "pay_", "convert_", "complete_", "rate_", "reorder",
+        )
+        if name.startswith(query_prefixes):
+            operation = "query"
+        elif name.startswith(delete_prefixes):
+            operation = "delete"
+        elif name.startswith(create_prefixes):
+            operation = "create"
+        elif name.startswith(update_prefixes):
+            operation = "update"
+        else:
+            operation = "update" if state_changed else "query"
+        return operation, default_target_type
+
+    @staticmethod
+    def generic_target_id(
+        tool_arguments: dict[str, Any],
+        observation: dict[str, Any] | str | None = None,
+    ) -> str:
+        for key, value in tool_arguments.items():
+            if key.lower().endswith("_id") and isinstance(value, str):
+                return value
+        for key in ("path", "source", "destination", "from_account", "to_account"):
+            value = tool_arguments.get(key)
+            if isinstance(value, str) and value:
+                return value
+        if isinstance(observation, dict):
+            stack = [observation]
+            while stack:
+                current = stack.pop()
+                for key, value in current.items():
+                    if key.lower().endswith("_id") and isinstance(value, str):
+                        return value
+                    if isinstance(value, dict):
+                        stack.append(value)
+        return ""
+
     # ── Domain-specific abstract methods ──
 
     @abstractmethod
@@ -206,7 +273,7 @@ class CalendarAdapter(DomainAdapter):
             result["operation"] = "terminal"
             return result
 
-        op, target = self.TOOL_MAP.get(tool_name, ("unknown", "calendar_event"))
+        op, target = self.tool_semantics(tool_name, "calendar_event", state_changed)
         result["operation"] = op
         result["target_type"] = target
 
@@ -322,7 +389,7 @@ class ShoppingAdapter(DomainAdapter):
             result["operation"] = "terminal"
             return result
 
-        op, target = self.TOOL_MAP.get(tool_name, ("unknown", "unknown"))
+        op, target = self.tool_semantics(tool_name, "shopping_resource", state_changed)
         result["operation"] = op
         result["target_type"] = target
 
@@ -410,7 +477,7 @@ class BankingAdapter(DomainAdapter):
         before_state: dict[str, Any] | None,
         after_state: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        op, ttype = self.TOOL_MAP.get(tool_name, ("query", "bank_account"))
+        op, ttype = self.tool_semantics(tool_name, "bank_account", state_changed)
         result: dict[str, Any] = {
             "operation": op,
             "target_type": ttype,
@@ -517,7 +584,7 @@ class EmailAdapter(DomainAdapter):
         self, action_type, tool_name, tool_arguments, observation,
         execution_success, state_changed, before_state, after_state,
     ) -> dict[str, Any]:
-        op, ttype = self.TOOL_MAP.get(tool_name, ("query", "email"))
+        op, ttype = self.tool_semantics(tool_name, "email", state_changed)
         result: dict[str, Any] = {
             "operation": op, "target_type": ttype, "target_id": "",
             "changed_fields": [], "created_ids": [], "deleted_ids": [],
@@ -576,7 +643,7 @@ class FilesystemAdapter(DomainAdapter):
         self, action_type, tool_name, tool_arguments, observation,
         execution_success, state_changed, before_state, after_state,
     ) -> dict[str, Any]:
-        op, ttype = self.TOOL_MAP.get(tool_name, ("query", "file"))
+        op, ttype = self.tool_semantics(tool_name, "file", state_changed)
         result: dict[str, Any] = {
             "operation": op, "target_type": ttype, "target_id": "",
             "changed_fields": [], "created_ids": [], "deleted_ids": [],
@@ -644,7 +711,7 @@ class PaymentsAdapter(DomainAdapter):
         self, action_type, tool_name, tool_arguments, observation,
         execution_success, state_changed, before_state, after_state,
     ) -> dict[str, Any]:
-        op, ttype = self.TOOL_MAP.get(tool_name, ("query", "invoice"))
+        op, ttype = self.tool_semantics(tool_name, "invoice", state_changed)
         result: dict[str, Any] = {
             "operation": op, "target_type": ttype, "target_id": "",
             "changed_fields": [], "created_ids": [], "deleted_ids": [],
@@ -713,7 +780,7 @@ class CRMAdapter(DomainAdapter):
         self, action_type, tool_name, tool_arguments, observation,
         execution_success, state_changed, before_state, after_state,
     ) -> dict[str, Any]:
-        op, ttype = self.TOOL_MAP.get(tool_name, ("query", "lead"))
+        op, ttype = self.tool_semantics(tool_name, "lead", state_changed)
         result: dict[str, Any] = {
             "operation": op, "target_type": ttype, "target_id": "",
             "changed_fields": [], "created_ids": [], "deleted_ids": [],
@@ -783,7 +850,7 @@ class IssueTrackerAdapter(DomainAdapter):
         self, action_type, tool_name, tool_arguments, observation,
         execution_success, state_changed, before_state, after_state,
     ) -> dict[str, Any]:
-        op, ttype = self.TOOL_MAP.get(tool_name, ("query", "issue"))
+        op, ttype = self.tool_semantics(tool_name, "issue", state_changed)
         result: dict[str, Any] = {
             "operation": op, "target_type": ttype, "target_id": "",
             "changed_fields": [], "created_ids": [], "deleted_ids": [],
@@ -842,7 +909,7 @@ class TeamChatAdapter(DomainAdapter):
         self, action_type, tool_name, tool_arguments, observation,
         execution_success, state_changed, before_state, after_state,
     ) -> dict[str, Any]:
-        op, ttype = self.TOOL_MAP.get(tool_name, ("query", "message"))
+        op, ttype = self.tool_semantics(tool_name, "message", state_changed)
         result: dict[str, Any] = {
             "operation": op, "target_type": ttype, "target_id": "",
             "changed_fields": [], "created_ids": [], "deleted_ids": [],
@@ -907,7 +974,7 @@ class FoodDeliveryAdapter(DomainAdapter):
         self, action_type, tool_name, tool_arguments, observation,
         execution_success, state_changed, before_state, after_state,
     ) -> dict[str, Any]:
-        op, ttype = self.TOOL_MAP.get(tool_name, ("query", "order"))
+        op, ttype = self.tool_semantics(tool_name, "order", state_changed)
         result: dict[str, Any] = {
             "operation": op, "target_type": ttype, "target_id": "",
             "changed_fields": [], "created_ids": [], "deleted_ids": [],

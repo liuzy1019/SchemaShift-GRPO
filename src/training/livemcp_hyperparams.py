@@ -36,7 +36,7 @@ class LiveMCPHyperparams:
     # I_shape: 启用 F_gamma 进度塑形项（0=关, 1=开）
     i_shape: int = 0
     # I_process: 启用 P_process 过程质量项（0=关, 1=开）
-    i_process: int = 1
+    i_process: int = 0
     # lambda_shape: F_gamma 权重系数
     lambda_shape: float = 0.5
     # lambda_process: P_process 权重系数

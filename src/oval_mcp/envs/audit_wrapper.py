@@ -109,6 +109,11 @@ class AuditWrapper:
             before_state=pre_state,
             after_state=post_state,
         )
+        if not normalized.get("target_id"):
+            normalized["target_id"] = self.adapter.generic_target_id(
+                call.arguments, result.observation if result else None
+            )
+        self._enrich_entity_delta(normalized, pre_state, post_state)
 
         # Cross-event pattern detection: track deleted entity data and
         # detect recreate by content matching on create.
@@ -146,7 +151,7 @@ class AuditWrapper:
         after_hash = compute_state_hash(post_state)
         changed_fields = (
             diff_state_keys(pre_state, post_state)
-            if normalized.get("changed_fields") is None
+            if not normalized.get("changed_fields")
             else normalized["changed_fields"]
         )
 
@@ -220,6 +225,11 @@ class AuditWrapper:
             before_state=pre_state,
             after_state=post_state,
         )
+        if not normalized.get("target_id"):
+            normalized["target_id"] = self.adapter.generic_target_id(
+                call.arguments, result.observation if result else None
+            )
+        self._enrich_entity_delta(normalized, pre_state, post_state)
 
         # Cross-event pattern detection
         operation = normalized.get("operation", "")
@@ -252,7 +262,7 @@ class AuditWrapper:
         after_hash = compute_state_hash(post_state)
         changed_fields = (
             diff_state_keys(pre_state, post_state)
-            if normalized.get("changed_fields") is None
+            if not normalized.get("changed_fields")
             else normalized["changed_fields"]
         )
 
@@ -283,6 +293,29 @@ class AuditWrapper:
             state_changed=result.state_changed if result else False,
             latency_ms=result.latency_ms if result else 0,
         )
+
+    def _enrich_entity_delta(
+        self,
+        normalized: dict[str, Any],
+        pre_state: dict[str, Any] | None,
+        post_state: dict[str, Any] | None,
+    ) -> None:
+        """Fill created/deleted IDs for tools handled by generic semantics."""
+        before = self.adapter._unwrap_domain_state(pre_state, self.adapter.domain_name)
+        after = self.adapter._unwrap_domain_state(post_state, self.adapter.domain_name)
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return
+        container_key = getattr(self.adapter, "entity_container_key", "events")
+        before_entities = before.get(container_key, {})
+        after_entities = after.get(container_key, {})
+        if not isinstance(before_entities, dict) or not isinstance(after_entities, dict):
+            return
+        created = sorted(set(after_entities) - set(before_entities))
+        deleted = sorted(set(before_entities) - set(after_entities))
+        if created and not normalized.get("created_ids"):
+            normalized["created_ids"] = created
+        if deleted and not normalized.get("deleted_ids"):
+            normalized["deleted_ids"] = deleted
 
     def finish(self, traj_log: TrajectoryEventLog) -> None:
         """Capture post-trajectory state snapshot."""
